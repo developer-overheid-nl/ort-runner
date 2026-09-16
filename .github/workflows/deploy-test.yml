@@ -1,0 +1,150 @@
+name: Deploy to Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ort-runner-deploy-test
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  INFRA_REPO: ${{ vars.INFRA_REPO }}
+  KUSTOMIZE_PATH: ${{ vars.KUSTOMIZE_PATH }}
+  DEPLOY_ENV: test
+
+jobs:
+  check-trigger:
+    name: Check deployment trigger
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.check.outputs.deploy }}
+    steps:
+      - name: Check manual run or commit keyword
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] || grep -Fqi '[deploy-test]' <<< "$COMMIT_MESSAGE"; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Gebruik [deploy-test] in de commit message of start de workflow handmatig."
+          fi
+
+  build-and-push:
+    name: Build and push test image
+    needs: check-trigger
+    if: needs.check-trigger.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: .
+          push: true
+          build-args: |
+            RUNNER_VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:test
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  update-infra:
+    name: Update test deployment
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate infra configuration
+        id: infra-repo
+        env:
+          CONFIGURED_INFRA_REPO: ${{ env.INFRA_REPO }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$CONFIGURED_INFRA_REPO" || "$CONFIGURED_INFRA_REPO" != */* ]]; then
+            echo "INFRA_REPO moet de vorm owner/repo hebben." >&2
+            exit 1
+          fi
+          if [[ -z "${KUSTOMIZE_PATH:-}" ]]; then
+            echo "KUSTOMIZE_PATH is niet ingesteld." >&2
+            exit 1
+          fi
+
+          echo "owner=${CONFIGURED_INFRA_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "repo=${CONFIGURED_INFRA_REPO#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release process app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ secrets.RELEASE_PROCES_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PROCES_APP_PRIVATE_KEY }}
+          owner: ${{ steps.infra-repo.outputs.owner }}
+          repositories: ${{ steps.infra-repo.outputs.repo }}
+
+      - name: Check out infra repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.INFRA_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Update test image tag
+        run: |
+          set -euo pipefail
+
+          KUSTOMIZATION_FILE="${KUSTOMIZE_PATH%/}/${DEPLOY_ENV}/kustomization.yaml"
+          if [[ ! -f "$KUSTOMIZATION_FILE" ]]; then
+            echo "Kustomization niet gevonden: $KUSTOMIZATION_FILE" >&2
+            exit 1
+          fi
+          if ! yq e '.images[] | select(.newName == strenv(IMAGE_NAME)) | .newName' "$KUSTOMIZATION_FILE" | grep -Fxq "$IMAGE_NAME"; then
+            echo "Image $IMAGE_NAME staat niet in $KUSTOMIZATION_FILE." >&2
+            exit 1
+          fi
+
+          yq e '(.images[] | select(.newName == strenv(IMAGE_NAME))).newTag = strenv(GITHUB_SHA)' \
+            -i "$KUSTOMIZATION_FILE"
+
+      - name: Commit and push test deployment
+        run: |
+          set -euo pipefail
+
+          KUSTOMIZATION_FILE="${KUSTOMIZE_PATH%/}/${DEPLOY_ENV}/kustomization.yaml"
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git add "$KUSTOMIZATION_FILE"
+
+          if git diff --cached --quiet; then
+            echo "De test deployment gebruikt deze image al."
+            exit 0
+          fi
+
+          git commit -m "test: ort-runner → ${{ github.sha }}
+
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+          git pull --rebase
+          git push

@@ -1,0 +1,102 @@
+name: Test and release runner
+
+on:
+  push:
+    branches: [main, develop]
+    tags:
+      - "v*.*.*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ort_image:
+        description: "Candidate ORT image; leave empty for the Dockerfile default"
+        required: false
+        type: string
+      ort_config_revision:
+        description: "ort-config commit to test"
+        default: v0.0.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: go vet ./...
+      - name: Check out baseline rules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: developer-overheid-nl/ort-config
+          ref: ${{ inputs.ort_config_revision || 'v0.0.1' }}
+          path: .test-config
+          persist-credentials: false
+      - name: Build runner image
+        env:
+          ORT_IMAGE: ${{ inputs.ort_image }}
+        run: |
+          args=(--build-arg "RUNNER_VERSION=$(git rev-parse HEAD)")
+          if [[ -n "$ORT_IMAGE" ]]; then
+            args+=(--build-arg "ORT_IMAGE=$ORT_IMAGE")
+          fi
+          docker build "${args[@]}" -t ort-runner:test .
+      - name: Test actual ORT pipeline and baseline rules
+        env:
+          ORT_RUNNER_TEST_IMAGE: ort-runner:test
+          ORT_RUNNER_TEST_CONFIG_DIR: ${{ github.workspace }}/.test-config
+        run: go test -tags=integration ./internal/runner -run TestContainerBaseline -count=1 -timeout=20m -v
+
+  release:
+    name: Publish image and GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            RUNNER_VERSION=${{ github.ref_name }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release create "$TAG_NAME" --title "$TAG_NAME" --generate-notes
