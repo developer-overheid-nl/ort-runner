@@ -40,9 +40,7 @@ docker run --rm \
   ghcr.io/developer-overheid-nl/ort-config:v0.0.1
 
 docker run --rm --init \
-  --user "$(id -u):$(id -g)" \
   --env-file .env.local \
-  -e HOME=/tmp \
   -v ort-config:/config:ro \
   -v "$PWD/output:/output" \
   ort-runner:dev \
@@ -141,8 +139,6 @@ DON_ORT_REVISION="$(git ls-remote "$DON_ORT_REPOSITORY" HEAD | cut -f1)"
 mkdir -p ../don-crawler-ort-output
 
 docker run --rm --init \
-  --user "$(id -u):$(id -g)" \
-  -e HOME=/tmp \
   -v ort-config:/config:ro \
   -v "$PWD/../don-crawler-ort-output:/output" \
   ort-runner:dev \
@@ -150,10 +146,9 @@ docker run --rm --init \
   --revision "$DON_ORT_REVISION"
 ```
 
-De UID/GID-optie maakt outputbestanden leesbaar voor de huidige gebruiker op Linux;
-`HOME=/tmp` geeft de tools een schrijfbare home-directory. Voor een lokale Git-repository
-kun je die extra read-only mounten en bijvoorbeeld `--repository file:///source`
-meegeven. Deze mount moet gedurende alle drie de ORT-stappen beschikbaar blijven.
+Voor een lokale Git-repository kun je die extra read-only mounten en bijvoorbeeld
+`--repository file:///source` meegeven. Deze mount moet gedurende alle drie de
+ORT-stappen beschikbaar blijven.
 
 Gebruik `docker run --rm ort-runner:dev --help` voor alle opties. De belangrijkste:
 
