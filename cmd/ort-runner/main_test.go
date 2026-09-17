@@ -6,15 +6,18 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCLIRejectsMissingAndUnknownInputs(t *testing.T) {
 	clearAuthEnv(t)
 	t.Setenv("ORT_REPOSITORIES_URL", "")
 	t.Setenv("ORT_RESULTS_URL", "")
-	for _, args := range [][]string{nil, {"--repository", "https://example.invalid/repo"}, {"--unknown"}} {
+	for _, args := range [][]string{nil, {"--unknown"}} {
 		var output bytes.Buffer
 		if code := execute(context.Background(), args, &output, &output); code != 2 {
 			t.Fatalf("args %v: exit %d, want usage error", args, code)
@@ -22,6 +25,27 @@ func TestCLIRejectsMissingAndUnknownInputs(t *testing.T) {
 		if output.Len() == 0 {
 			t.Fatal("usage error without explanation")
 		}
+	}
+}
+
+func TestCLIAcceptsRepositoryWithoutRevision(t *testing.T) {
+	clearAuthEnv(t)
+	t.Setenv("ORT_REPOSITORIES_URL", "")
+	t.Setenv("ORT_RESULTS_URL", "")
+	configDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(configDir, "evaluator.rules.kts"), []byte("// test\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	code := execute(context.Background(), []string{
+		"--repository", filepath.Join(t.TempDir(), "missing-repository"),
+		"--config-dir", configDir,
+		"--output-dir", t.TempDir(),
+		"--stage-timeout", time.Second.String(),
+	}, &output, &output)
+	if code != 1 || !strings.Contains(output.String(), "checkout failed") {
+		t.Fatalf("repository without revision was rejected as invalid CLI input: code=%d, output=%s", code, output.String())
 	}
 }
 

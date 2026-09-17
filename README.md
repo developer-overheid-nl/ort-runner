@@ -123,9 +123,8 @@ stopt de batch voordat er scans starten.
 
 ## Eén repository testen
 
-Benodigd: Docker, Git en een gevuld `ort-config`-volume. Onderstaand voorbeeld
-bepaalt eerst de huidige commit van `don-crawler`; tijdens de scan blijft die commit
-vaststaan.
+Benodigd: Docker, Git en een gevuld `ort-config`-volume. Zonder `--revision`
+controleert de runner de laatste commit van de default branch.
 
 ```sh
 docker build -t ort-runner:dev .
@@ -134,16 +133,13 @@ docker run --rm \
   -v ort-config:/target \
   ghcr.io/developer-overheid-nl/ort-config:v0.0.1
 
-DON_ORT_REPOSITORY="https://github.com/developer-overheid-nl/don-crawler.git"
-DON_ORT_REVISION="$(git ls-remote "$DON_ORT_REPOSITORY" HEAD | cut -f1)"
 mkdir -p ../don-crawler-ort-output
 
 docker run --rm --init \
   -v ort-config:/config:ro \
   -v "$PWD/../don-crawler-ort-output:/output" \
   ort-runner:dev \
-  --repository "$DON_ORT_REPOSITORY" \
-  --revision "$DON_ORT_REVISION"
+  --repository "https://github.com/developer-overheid-nl/don-crawler.git"
 ```
 
 Voor een lokale Git-repository kun je die extra read-only mounten en bijvoorbeeld
@@ -157,7 +153,7 @@ Gebruik `docker run --rm ort-runner:dev --help` voor alle opties. De belangrijks
 | `--repositories-url` | GET-endpoint voor een batch | `ORT_REPOSITORIES_URL` |
 | `--results-url` | POST-endpoint voor batchresultaten | `ORT_RESULTS_URL`, anders alleen lokaal bewaren |
 | `--repository` | Git-URL of lokaal Git-pad voor een losse scan | verplicht bij losse scan |
-| `--revision` | Volledige commit-SHA van 40 tekens | verplicht bij losse scan |
+| `--revision` | Volledige commit-SHA van 40 tekens | laatste commit van de default branch |
 | `--config-dir` | ORT-configuratie | `/config` |
 | `--output-dir` | Bovenliggende map voor scanresultaten | `/output` |
 | `--stage-timeout` | Maximale duur per checkout of ORT-stap | `30m` |
@@ -243,15 +239,15 @@ Een semver-tag met de vorm `v*.*.*` start na de tests de publicatie van het
 multi-platform runner-image en maakt een GitHub Release:
 
 ```text
-ghcr.io/developer-overheid-nl/ort-runner:v0.0.1
+ghcr.io/developer-overheid-nl/ort-runner:v0.0.2
 ghcr.io/developer-overheid-nl/ort-runner:<commit-sha>
 ```
 
 Maak een release vanaf de gewenste commit met:
 
 ```sh
-git tag v0.0.1
-git push origin v0.0.1
+git tag v0.0.2
+git push origin v0.0.2
 ```
 
 ## Ontwikkelen

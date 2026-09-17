@@ -71,7 +71,7 @@ func TestContainerBaseline(t *testing.T) {
 			cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--name", name,
 				"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "-e", "HOME=/tmp",
 				"-v", repo+":/fixture/repo:ro", "-v", config+":/config:ro", "-v", output+":/output",
-				image, "--repository", "file:///fixture/repo", "--revision", revision,
+				image, "--repository", "file:///fixture/repo",
 				"--stage-timeout", "2m")
 			console, commandErr := cmd.CombinedOutput()
 			runs, err := filepath.Glob(filepath.Join(output, "run-*"))
