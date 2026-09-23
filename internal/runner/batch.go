@@ -17,44 +17,6 @@ func RunBatch(ctx context.Context, cfg BatchConfig) (BatchReport, error) {
 	return runBatch(ctx, cfg, Run)
 }
 
-func loadRepositorySets(ctx context.Context, source register.Client, endpoint string) ([]register.Repository, error) {
-	baseURL, err := register.ParseURL(endpoint)
-	if err != nil {
-		return nil, err
-	}
-	baseQuery := baseURL.Query()
-	baseQuery.Del("publiccode")
-	baseURL.RawQuery = baseQuery.Encode()
-	missingPublicCodeURL := *baseURL
-	query := missingPublicCodeURL.Query()
-	query.Set("publiccode", "false")
-	missingPublicCodeURL.RawQuery = query.Encode()
-
-	endpoints := []string{baseURL.String()}
-	if filtered := missingPublicCodeURL.String(); filtered != endpoints[0] {
-		endpoints = append(endpoints, filtered)
-	}
-	repositories := make([]register.Repository, 0)
-	seen := make(map[string]string)
-	for _, repositoryEndpoint := range endpoints {
-		items, err := source.Repositories(ctx, repositoryEndpoint)
-		if err != nil {
-			return nil, err
-		}
-		for _, item := range items {
-			if existingURL, ok := seen[item.ID]; ok {
-				if existingURL != item.URL {
-					return nil, fmt.Errorf("repository %s has conflicting URLs across register filters", item.ID)
-				}
-				continue
-			}
-			seen[item.ID] = item.URL
-			repositories = append(repositories, item)
-		}
-	}
-	return repositories, nil
-}
-
 func runBatch(ctx context.Context, cfg BatchConfig, scan func(context.Context, Config) (Report, error)) (report BatchReport, batchErr error) {
 	if cfg.Runner.Repository != "" || cfg.Runner.Revision != "" {
 		return report, fmt.Errorf("batch mode cannot be combined with a single repository or revision")
@@ -112,7 +74,7 @@ func runBatch(ctx context.Context, cfg BatchConfig, scan func(context.Context, C
 	source := register.Client{HTTP: registerHTTPClient, APIKey: cfg.RegisterAPIKey}
 	destination := register.Client{HTTP: resultsHTTPClient}
 	// Read all pages before lengthy scans, keeping list retrieval close together in time.
-	repositories, err := loadRepositorySets(ctx, source, cfg.RepositoriesURL)
+	repositories, err := source.RepositorySets(ctx, cfg.RepositoriesURL)
 	if err != nil {
 		return report, fmt.Errorf("read register: %w", err)
 	}

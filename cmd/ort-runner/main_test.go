@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,7 +18,7 @@ func TestCLIRejectsMissingAndUnknownInputs(t *testing.T) {
 	clearAuthEnv(t)
 	t.Setenv("ORT_REPOSITORIES_URL", "")
 	t.Setenv("ORT_RESULTS_URL", "")
-	for _, args := range [][]string{nil, {"--unknown"}} {
+	for _, args := range [][]string{nil, {"--unknown"}, {"unknown-command"}} {
 		var output bytes.Buffer
 		if code := execute(context.Background(), args, &output, &output); code != 2 {
 			t.Fatalf("args %v: exit %d, want usage error", args, code)
@@ -107,5 +108,13 @@ func TestHelpDoesNotStartScan(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "-revision") {
 		t.Fatal("help does not explain revision input")
+	}
+}
+
+func TestMainGoStillRunsLegacyCLI(t *testing.T) {
+	command := exec.Command("go", "run", "main.go", "--help")
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "-revision") {
+		t.Fatalf("go run main.go no longer supports the legacy CLI: %v\n%s", err, output)
 	}
 }

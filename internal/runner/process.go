@@ -13,6 +13,18 @@ import (
 	"time"
 )
 
+var protectedEnvironment = map[string]struct{}{
+	"ORT_REGISTER_API_KEY":    {},
+	"AUTH_TOKEN_URL":          {},
+	"AUTH_CLIENT_ID":          {},
+	"AUTH_CLIENT_SECRET":      {},
+	"AUTH_SCOPES":             {},
+	"KEYCLOAK_BASE_URL":       {},
+	"KEYCLOAK_REALM":          {},
+	"KUBERNETES_SERVICE_HOST": {},
+	"KUBERNETES_SERVICE_PORT": {},
+}
+
 func runCommand(ctx context.Context, name string, args []string, dir string, env []string, logPath string) (int, error) {
 	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
@@ -24,8 +36,7 @@ func runCommand(ctx context.Context, name string, args []string, dir string, env
 	for _, entry := range os.Environ() {
 		// Registry credentials belong to the HTTP client, not scanned code or package managers.
 		name := strings.SplitN(entry, "=", 2)[0]
-		if name == "ORT_REGISTER_API_KEY" || name == "AUTH_TOKEN_URL" || name == "AUTH_CLIENT_ID" ||
-			name == "AUTH_CLIENT_SECRET" || name == "AUTH_SCOPES" {
+		if _, protected := protectedEnvironment[name]; protected {
 			continue
 		}
 		cmd.Env = append(cmd.Env, entry)

@@ -17,6 +17,41 @@ type Client struct {
 	APIKey string
 }
 
+func (c Client) RepositorySets(ctx context.Context, endpoint string) ([]Repository, error) {
+	base, err := ParseURL(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	query := base.Query()
+	query.Del("publiccode")
+	base.RawQuery = query.Encode()
+
+	missing := *base
+	missingQuery := missing.Query()
+	missingQuery.Set("publiccode", "false")
+	missing.RawQuery = missingQuery.Encode()
+
+	result := make([]Repository, 0)
+	seen := make(map[string]string)
+	for _, candidate := range []string{base.String(), missing.String()} {
+		items, err := c.Repositories(ctx, candidate)
+		if err != nil {
+			return nil, err
+		}
+		for _, repository := range items {
+			if existing, ok := seen[repository.ID]; ok {
+				if existing != repository.URL {
+					return nil, fmt.Errorf("repository %s has conflicting URLs across register filters", repository.ID)
+				}
+				continue
+			}
+			seen[repository.ID] = repository.URL
+			result = append(result, repository)
+		}
+	}
+	return result, nil
+}
+
 func (c Client) Repositories(ctx context.Context, endpoint string) ([]Repository, error) {
 	u, err := ParseURL(endpoint)
 	if err != nil {
@@ -88,7 +123,18 @@ func (c Client) Repositories(ctx context.Context, endpoint string) ([]Repository
 }
 
 func (c Client) Post(ctx context.Context, endpoint string, data []byte) error {
-	response, err := c.request(ctx, http.MethodPost, endpoint, data)
+	return c.post(ctx, endpoint, data, "")
+}
+
+func (c Client) PostResult(ctx context.Context, endpoint string, data []byte, idempotencyKey string) error {
+	if idempotencyKey == "" {
+		return fmt.Errorf("idempotency key is required")
+	}
+	return c.post(ctx, endpoint, data, idempotencyKey)
+}
+
+func (c Client) post(ctx context.Context, endpoint string, data []byte, idempotencyKey string) error {
+	response, err := c.requestWithHeaders(ctx, http.MethodPost, endpoint, data, map[string]string{"Idempotency-Key": idempotencyKey})
 	if err != nil {
 		return err
 	}
@@ -101,6 +147,10 @@ func (c Client) Post(ctx context.Context, endpoint string, data []byte) error {
 }
 
 func (c Client) request(ctx context.Context, method, endpoint string, data []byte) (*http.Response, error) {
+	return c.requestWithHeaders(ctx, method, endpoint, data, nil)
+}
+
+func (c Client) requestWithHeaders(ctx context.Context, method, endpoint string, data []byte, headers map[string]string) (*http.Response, error) {
 	if _, err := ParseURL(endpoint); err != nil {
 		return nil, err
 	}
@@ -111,6 +161,11 @@ func (c Client) request(ctx context.Context, method, endpoint string, data []byt
 	req.Header.Set("Accept", "application/json")
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for name, value := range headers {
+		if value != "" {
+			req.Header.Set(name, value)
+		}
 	}
 	if c.APIKey != "" {
 		req.Header.Set("X-Api-Key", c.APIKey)

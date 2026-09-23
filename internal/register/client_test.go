@@ -84,6 +84,44 @@ func TestEmptyRegisterIsValid(t *testing.T) {
 	}
 }
 
+func TestRepositorySetsCombinesPublicCodeFilters(t *testing.T) {
+	requests := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests[r.URL.RawQuery]++
+		w.Header().Set("Total-Pages", "1")
+		if r.URL.Query().Get("publiccode") == "false" {
+			fmt.Fprint(w, `[{"id":"shared","url":"https://example.test/shared.git"},{"id":"two","url":"https://example.test/two.git"}]`)
+			return
+		}
+		fmt.Fprint(w, `[{"id":"one","url":"https://example.test/one.git"},{"id":"shared","url":"https://example.test/shared.git"}]`)
+	}))
+	defer server.Close()
+
+	got, err := (Client{HTTP: server.Client()}).RepositorySets(context.Background(), server.URL+"/repositories?publiccode=true")
+	if err != nil || len(got) != 3 || requests["page=1&perPage=100"] != 1 || requests["page=1&perPage=100&publiccode=false"] != 1 {
+		t.Fatalf("repositories=%+v requests=%v err=%v", got, requests, err)
+	}
+	if got[0].ID != "one" || got[1].ID != "shared" || got[2].ID != "two" {
+		t.Fatalf("first-seen order not preserved: %+v", got)
+	}
+}
+
+func TestRepositorySetsRejectsConflictingURLs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Total-Pages", "1")
+		if r.URL.Query().Get("publiccode") == "false" {
+			fmt.Fprint(w, `[{"id":"shared","url":"https://example.test/new.git"}]`)
+			return
+		}
+		fmt.Fprint(w, `[{"id":"shared","url":"https://example.test/original.git"}]`)
+	}))
+	defer server.Close()
+
+	if _, err := (Client{HTTP: server.Client()}).RepositorySets(context.Background(), server.URL+"/repositories"); err == nil || !strings.Contains(err.Error(), "conflicting URLs") {
+		t.Fatalf("conflicting repository URLs accepted: %v", err)
+	}
+}
+
 func TestPostSendsJSONAndReportsRejectedDelivery(t *testing.T) {
 	for _, status := range []int{201, 204, 400, 500} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
@@ -101,6 +139,19 @@ func TestPostSendsJSONAndReportsRejectedDelivery(t *testing.T) {
 				t.Fatalf("status %d: error=%v", status, err)
 			}
 		})
+	}
+}
+
+func TestPostResultSendsIdempotencyKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Idempotency-Key") != "ort-123" || r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("result headers=%v", r.Header)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	if err := (Client{HTTP: server.Client()}).PostResult(context.Background(), server.URL, []byte(`{}`), "ort-123"); err != nil {
+		t.Fatal(err)
 	}
 }
 

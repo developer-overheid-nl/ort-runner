@@ -7,9 +7,14 @@ repository een resultaat naar een instelbaar POST-endpoint stuurt. De pipeline i
 versieerbare [ort-config](https://github.com/developer-overheid-nl/ort-config).
 
 De runner en ORT draaien samen in één container. De Go-code roept de bestaande
-`ort`-commands rechtstreeks aan. Eén aanroep verwerkt één batch en stopt daarna;
-een scheduler of applicatie kan de container starten. Voor losse tests kun je ook
-één repository op een specifieke commit scannen.
+`ort`-commands rechtstreeks aan. Lokaal kan één aanroep nog steeds één repository
+of een volledige sequentiële batch verwerken.
+
+In Kubernetes start een geplande controller één Indexed Job. Iedere worker-Pod
+verwerkt precies één repository. Daardoor kan een zwaar project alleen zijn eigen
+worker laten mislukken en begint een herstart van de controller niet opnieuw bij
+repository één. `controller` en `worker` zijn interne deploymentcommando's; voor
+lokaal gebruik blijven `--repository` en `--repositories-url` de ingangen.
 
 ## Repositories uit het register verwerken
 
@@ -115,11 +120,50 @@ batch-123456/
 `batch.json` staan alle verwerkte register-id's met hun scanstatus en afleverstatus:
 `posted`, `failed`, `not_configured` of `pending` bij een afgebroken batch.
 
-Een mislukte POST maakt de batch onvolledig, bewaart het bericht en stopt de overige
-scans niet. Er zijn geen automatische POST-retries zolang het endpoint geen afspraken
-over dubbele berichten heeft. Een volgende batch scant opnieuw; bewaarde berichten
-worden niet automatisch opnieuw verstuurd. Een fout bij het ophalen van de lijst
-stopt de batch voordat er scans starten.
+Een mislukte POST maakt de lokale, sequentiële batch onvolledig, bewaart het bericht
+en stopt de overige scans niet. Deze modus doet geen automatische POST-retries. Een
+volgende batch scant opnieuw; bewaarde berichten worden niet automatisch opnieuw
+verstuurd. Een fout bij het ophalen van de lijst stopt de batch voordat er scans
+starten. Kubernetes-workers gebruiken een vaste idempotency-key en proberen alleen
+de POST maximaal vijf keer; de scan zelf wordt daarbij niet herhaald.
+
+## Kubernetes-uitvoering
+
+De Kubernetes-uitvoering vereist serverversie **1.33 of nieuwer** vanwege
+`backoffLimitPerIndex`. De controller leest de repositorylijst één keer, maakt een
+onveranderlijk snapshot van de lijst en de ORT-configuratie en start standaard tien
+workers tegelijk. Kubernetes bewaart de voortgang in de Indexed Job; er is geen
+aparte database of queue.
+
+Een worker vraagt standaard `200m` CPU en `4Gi` geheugen aan, met limieten van
+`2000m` en `8Gi`. Binnen die grens krijgt ORT maximaal `4Gi` Java-heap. De door de
+worker gemounte Gradle-config begrenst Gradle op `2Gi` heap en `512Mi` metaspace,
+ook als een gescande repository hogere waarden bevat. Een mislukte index krijgt
+precies één nieuwe Pod. Daarna komt die index in `failedIndexes`; andere indexen
+gaan door. Afgeronde worker Jobs en hun Pods worden na 24 uur opgeruimd.
+
+```sh
+kubectl -n tn-don-oss-test get job <worker-job> \
+  -o jsonpath='{.status.completedIndexes}{"\n"}{.status.failedIndexes}{"\n"}'
+```
+
+De belangrijkste controllerwaarden zijn:
+
+| Omgevingsvariabele | Standaard in test |
+| --- | --- |
+| `ORT_PARALLELISM` | `10` |
+| `ORT_REPOSITORY_RETRY_LIMIT` | `1` |
+| `ORT_WORKER_CPU_REQUEST` / `ORT_WORKER_CPU_LIMIT` | `200m` / `2000m` |
+| `ORT_WORKER_MEMORY_REQUEST` / `ORT_WORKER_MEMORY_LIMIT` | `4Gi` / `8Gi` |
+
+Alleen de controller krijgt toegang tot de Kubernetes-API en de API-key voor het
+register. Worker-Pods krijgen geen ServiceAccount-token of register-API-key. OAuth-
+gegevens voor resultaatlevering gaan alleen naar workers als `ORT_RESULTS_URL` is
+ingesteld en worden niet doorgegeven aan ORT of package-managers.
+
+In test mag `ORT_RESULTS_URL` leeg blijven. Dan blijven submissions alleen in de
+tijdelijke worker-Pod beschikbaar. Een productie-inrichting vereist daarom eerst
+een resultaatendpoint; de idempotency-key heeft de vorm `ort:<sha256>`.
 
 ## Eén repository testen
 

@@ -7,15 +7,21 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	commonauth "github.com/developer-overheid-nl/don-register-common/auth"
 	"github.com/developer-overheid-nl/ort-runner/internal/runner"
 )
 
 var version = "dev"
+
+var controllerCommand = unavailableSubcommand("controller")
+var workerCommand = unavailableSubcommand("worker")
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
@@ -25,6 +31,31 @@ func main() {
 }
 
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	switch first(args) {
+	case "controller":
+		return controllerCommand(ctx, args[1:], stdout, stderr)
+	case "worker":
+		return workerCommand(ctx, args[1:], stdout, stderr)
+	default:
+		return executeLegacy(ctx, args, stdout, stderr)
+	}
+}
+
+func unavailableSubcommand(name string) func(context.Context, []string, io.Writer, io.Writer) int {
+	return func(_ context.Context, _ []string, _ io.Writer, stderr io.Writer) int {
+		fmt.Fprintf(stderr, "%s is only available when the complete ort-runner package is built\n", name)
+		return 2
+	}
+}
+
+func first(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[0]
+}
+
+func executeLegacy(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("ort-runner", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	cfg := runner.Config{RunnerVersion: version, ORTImage: os.Getenv("ORT_RUNNER_ORT_IMAGE")}
@@ -86,4 +117,33 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func configureBatchHTTPClients(ctx context.Context, config *runner.BatchConfig) error {
+	base := &http.Client{Timeout: config.HTTPTimeout}
+	config.RegisterHTTPClient = base
+	if config.ResultsURL == "" {
+		config.ResultsHTTPClient = base
+		return nil
+	}
+	authenticated, err := newResultsHTTPClient(ctx, config.HTTPTimeout)
+	if err != nil {
+		return err
+	}
+	config.ResultsHTTPClient = authenticated
+	return nil
+}
+
+func newResultsHTTPClient(ctx context.Context, timeout time.Duration) (*http.Client, error) {
+	base := &http.Client{Timeout: timeout}
+	authConfig := commonauth.ClientCredentialsConfig{
+		TokenURL:     os.Getenv("AUTH_TOKEN_URL"),
+		ClientID:     os.Getenv("AUTH_CLIENT_ID"),
+		ClientSecret: os.Getenv("AUTH_CLIENT_SECRET"),
+		Scopes:       strings.Fields(os.Getenv("AUTH_SCOPES")),
+	}
+	if authConfig.TokenURL == "" && authConfig.ClientID == "" && authConfig.ClientSecret == "" {
+		return base, nil
+	}
+	return commonauth.NewClientCredentialsHTTPClient(ctx, authConfig, base)
 }
