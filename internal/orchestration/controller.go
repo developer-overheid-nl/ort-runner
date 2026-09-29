@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+// ConfigMaps are limited to 1 MiB; the margin leaves room for metadata.
 const manifestChunkLimit = 700 << 10
 
 type ControllerConfig struct {
@@ -33,11 +35,8 @@ type ControllerConfig struct {
 	RepositoriesURL string
 	ResultsURL      string
 	ConfigDir       string
-	Parallelism     int32
-	RetryLimit      int32
-	WorkerResources WorkerResources
+	Settings        WorkerSettings
 	RegisterClient  register.Client
-	ResultsClient   register.Client
 	FailureReporter FailureReporter
 }
 
@@ -49,16 +48,25 @@ type BatchSummary struct {
 	FailedRepositoryIDs []string `json:"failedRepositoryIds"`
 }
 
+// FailureReporter records repositories whose worker never delivered a result.
 type FailureReporter interface {
 	ReportFailedIndex(context.Context, string, register.Repository) error
 }
 
+// RunController creates or adopts the Indexed Job of this batch and waits until
+// every repository has completed or failed.
 func RunController(ctx context.Context, client kubernetes.Interface, cfg ControllerConfig) (BatchSummary, error) {
 	if client == nil {
 		return BatchSummary{}, fmt.Errorf("Kubernetes client is required")
 	}
 	if cfg.Namespace == "" || cfg.PodName == "" || cfg.ContainerName == "" || cfg.BatchName == "" || cfg.RepositoriesURL == "" || cfg.ConfigDir == "" {
 		return BatchSummary{}, fmt.Errorf("namespace, Pod, container, batch, repository URL and config directory are required")
+	}
+	if cfg.ResultsURL != "" && cfg.FailureReporter == nil {
+		return BatchSummary{}, fmt.Errorf("failure reporter is required when results are configured")
+	}
+	if err := cfg.Settings.Validate(); err != nil {
+		return BatchSummary{}, err
 	}
 	pod, err := client.CoreV1().Pods(cfg.Namespace).Get(ctx, cfg.PodName, metav1.GetOptions{})
 	if err != nil {
@@ -69,47 +77,39 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 		return BatchSummary{}, err
 	}
 
-	repositories, err := cfg.RegisterClient.RepositorySets(ctx, cfg.RepositoriesURL)
+	manifest, chunks, err := batchManifest(ctx, client, cfg, owner)
 	if err != nil {
-		return BatchSummary{}, fmt.Errorf("read repositories: %w", err)
+		return BatchSummary{}, err
 	}
-	if len(repositories) == 0 {
+	if len(manifest.Repositories) == 0 {
 		return BatchSummary{BatchID: cfg.BatchName, FailedRepositoryIDs: []string{}}, nil
-	}
-	manifest := Manifest{SchemaVersion: manifestSchemaVersion, BatchID: cfg.BatchName, Repositories: repositories}
-	chunks, err := EncodeManifest(manifest, manifestChunkLimit)
-	if err != nil {
-		return BatchSummary{}, fmt.Errorf("encode repository manifest: %w", err)
-	}
-	manifest, err = DecodeManifest(chunks)
-	if err != nil {
-		return BatchSummary{}, fmt.Errorf("verify repository manifest: %w", err)
 	}
 	configData, err := readConfigData(cfg.ConfigDir)
 	if err != nil {
 		return BatchSummary{}, err
 	}
-
-	resources := cfg.WorkerResources.deepCopy()
-	resources.Image = image
-	resources.BatchID = cfg.BatchName
-	resources.RepositoryCount = len(manifest.Repositories)
-	resources.Parallelism = cfg.Parallelism
-	resources.RetryLimit = cfg.RetryLimit
-	resources.ConfigData = configData
-	resources.ManifestChunks = chunks
-	resources.Environment = environment
+	resources := WorkerResources{
+		Image:             image,
+		BatchID:           cfg.BatchName,
+		RepositoryCount:   len(manifest.Repositories),
+		ConfigData:        configData,
+		ManifestChunks:    chunks,
+		ResultEnvironment: ResultEnvironment(environment),
+		Settings:          cfg.Settings,
+	}
 	configMaps, err := BuildConfigMaps(owner, cfg.Namespace, resources)
 	if err != nil {
 		return BatchSummary{}, err
 	}
+	// Chunk 0 is created last: its presence proves all other chunks exist, which
+	// batchManifest relies on after a controller restart.
+	slices.Reverse(configMaps[1:])
 	for _, desired := range configMaps {
 		if err := createOrVerifyConfigMap(ctx, client, desired); err != nil {
 			return BatchSummary{}, err
 		}
 	}
-	jobName := resourceName(owner, "workers")
-	desiredJob, err := BuildIndexedJob(owner, cfg.Namespace, jobName, resources)
+	desiredJob, err := BuildIndexedJob(owner, cfg.Namespace, workerJobName(owner), resources)
 	if err != nil {
 		return BatchSummary{}, err
 	}
@@ -117,7 +117,7 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 		return BatchSummary{}, err
 	}
 
-	terminal, err := waitForTerminalJob(ctx, client, cfg.Namespace, jobName)
+	terminal, err := waitForTerminalJob(ctx, client, cfg.Namespace, desiredJob.Name)
 	if err != nil {
 		return BatchSummary{}, err
 	}
@@ -126,24 +126,84 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 		return BatchSummary{}, err
 	}
 	for _, index := range failedIndexes {
-		repository, lookupErr := manifest.Repository(index)
-		if lookupErr != nil {
-			return summary, lookupErr
-		}
+		repository := manifest.Repositories[index]
 		summary.FailedRepositoryIDs = append(summary.FailedRepositoryIDs, repository.ID)
-		if cfg.ResultsURL != "" {
-			if cfg.FailureReporter == nil {
-				return summary, fmt.Errorf("failed index reporter is required when results are configured")
-			}
-			if reportErr := cfg.FailureReporter.ReportFailedIndex(ctx, cfg.BatchName, repository); reportErr != nil {
-				return summary, fmt.Errorf("report failed repository %s: %w", repository.ID, reportErr)
-			}
+		if cfg.ResultsURL == "" {
+			continue
+		}
+		if err := cfg.FailureReporter.ReportFailedIndex(ctx, cfg.BatchName, repository); err != nil {
+			return summary, fmt.Errorf("report failed repository %s: %w", repository.ID, err)
 		}
 	}
 	sort.Strings(summary.FailedRepositoryIDs)
 	return summary, nil
 }
 
+// batchManifest reuses the repository list stored by an earlier attempt of this
+// controller Job. Only a first attempt reads the register, so a register change
+// during the batch cannot conflict with resources that already exist.
+func batchManifest(ctx context.Context, client kubernetes.Interface, cfg ControllerConfig, owner metav1.OwnerReference) (Manifest, []Chunk, error) {
+	stored, err := storedManifestChunks(ctx, client, cfg.Namespace, owner)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	if stored != nil {
+		manifest, err := DecodeManifest(stored)
+		if err != nil {
+			return Manifest{}, nil, fmt.Errorf("stored repository manifest: %w", err)
+		}
+		if manifest.BatchID != cfg.BatchName {
+			return Manifest{}, nil, fmt.Errorf("stored manifest belongs to batch %q", manifest.BatchID)
+		}
+		return manifest, stored, nil
+	}
+
+	repositories, err := cfg.RegisterClient.RepositorySets(ctx, cfg.RepositoriesURL)
+	if err != nil {
+		return Manifest{}, nil, fmt.Errorf("read repositories: %w", err)
+	}
+	manifest, err := NewManifest(cfg.BatchName, repositories)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	chunks, err := EncodeManifest(manifest, manifestChunkLimit)
+	if err != nil {
+		return Manifest{}, nil, fmt.Errorf("encode repository manifest: %w", err)
+	}
+	return manifest, chunks, nil
+}
+
+func storedManifestChunks(ctx context.Context, client kubernetes.Interface, namespace string, owner metav1.OwnerReference) ([]Chunk, error) {
+	first, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, manifestConfigMapName(owner, 0), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	count, err := strconv.Atoi(first.Annotations[chunkCountAnnotation])
+	if err != nil || count <= 0 {
+		return nil, fmt.Errorf("stored manifest chunk count %q is invalid", first.Annotations[chunkCountAnnotation])
+	}
+	chunks := make([]Chunk, 0, count)
+	for index := range count {
+		configMap := first
+		if index > 0 {
+			configMap, err = client.CoreV1().ConfigMaps(namespace).Get(ctx, manifestConfigMapName(owner, index), metav1.GetOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("read stored manifest chunk %d: %w", index, err)
+			}
+		}
+		if !sameOwner(configMap.OwnerReferences, owner) {
+			return nil, fmt.Errorf("ConfigMap %s conflict: not owned by this batch", configMap.Name)
+		}
+		data := []byte(configMap.Data[manifestChunkKey])
+		chunks = append(chunks, Chunk{Index: index, Count: count, Digest: digest(data), Data: data})
+	}
+	return chunks, nil
+}
+
+// ParseIndexes parses the compact index list of a Job status, such as "0,2-4".
 func ParseIndexes(value string, total int) ([]int, error) {
 	if total < 0 {
 		return nil, fmt.Errorf("total must not be negative")
@@ -154,16 +214,13 @@ func ParseIndexes(value string, total int) ([]int, error) {
 	seen := make(map[int]struct{})
 	indexes := make([]int, 0)
 	for _, part := range strings.Split(value, ",") {
-		if part == "" || strings.TrimSpace(part) != part {
-			return nil, fmt.Errorf("invalid index expression %q", value)
-		}
 		bounds := strings.Split(part, "-")
-		if len(bounds) > 2 || bounds[0] == "" || len(bounds) == 2 && bounds[1] == "" {
+		if len(bounds) > 2 {
 			return nil, fmt.Errorf("invalid index expression %q", part)
 		}
 		first, err := strconv.Atoi(bounds[0])
 		if err != nil || first < 0 || first >= total {
-			return nil, fmt.Errorf("index %q outside range", bounds[0])
+			return nil, fmt.Errorf("index %q outside range", part)
 		}
 		last := first
 		if len(bounds) == 2 {
@@ -185,7 +242,7 @@ func ParseIndexes(value string, total int) ([]int, error) {
 }
 
 func inspectControllerPod(pod *corev1.Pod, containerName string) (metav1.OwnerReference, string, []corev1.EnvVar, error) {
-	owners := make([]metav1.OwnerReference, 0, 1)
+	var owners []metav1.OwnerReference
 	for _, owner := range pod.OwnerReferences {
 		if owner.Controller != nil && *owner.Controller && owner.Kind == "Job" && owner.UID != "" {
 			owners = append(owners, owner)
@@ -199,36 +256,19 @@ func inspectControllerPod(pod *corev1.Pod, containerName string) (metav1.OwnerRe
 			if container.Image == "" {
 				return metav1.OwnerReference{}, "", nil, fmt.Errorf("controller image is empty")
 			}
-			return owners[0], container.Image, selectWorkerEnvironment(container.Env), nil
+			return owners[0], container.Image, container.Env, nil
 		}
 	}
 	return metav1.OwnerReference{}, "", nil, fmt.Errorf("controller container %q not found", containerName)
 }
 
-func selectWorkerEnvironment(environment []corev1.EnvVar) []corev1.EnvVar {
-	allowed := map[string]struct{}{
-		"ORT_RESULTS_URL": {}, "AUTH_TOKEN_URL": {}, "AUTH_CLIENT_ID": {}, "AUTH_CLIENT_SECRET": {}, "AUTH_SCOPES": {},
-		"KEYCLOAK_BASE_URL": {}, "KEYCLOAK_REALM": {},
-	}
-	result := make([]corev1.EnvVar, 0, len(environment))
-	for _, variable := range environment {
-		if _, ok := allowed[variable.Name]; ok {
-			result = append(result, *variable.DeepCopy())
-		}
-	}
-	return result
-}
-
 func readConfigData(root string) (map[string][]byte, error) {
 	data := make(map[string][]byte)
 	err := filepath.WalkDir(root, func(file string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
+		if walkErr != nil || file == root || entry.IsDir() {
 			return walkErr
 		}
-		if file == root || entry.IsDir() {
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
+		if !entry.Type().IsRegular() {
 			return fmt.Errorf("config entry %s is not a regular file", file)
 		}
 		relative, err := filepath.Rel(root, file)
@@ -245,12 +285,14 @@ func readConfigData(root string) (map[string][]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config directory: %w", err)
 	}
-	if rules, ok := data["evaluator.rules.kts"]; !ok || len(rules) == 0 {
+	if len(data["evaluator.rules.kts"]) == 0 {
 		return nil, fmt.Errorf("config directory must contain evaluator.rules.kts")
 	}
 	return data, nil
 }
 
+// Existing batch resources are never updated: a difference means another
+// snapshot, so the controller fails instead of mixing two batches.
 func createOrVerifyConfigMap(ctx context.Context, client kubernetes.Interface, desired *corev1.ConfigMap) error {
 	existing, err := client.CoreV1().ConfigMaps(desired.Namespace).Get(ctx, desired.Name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -283,61 +325,50 @@ func createOrVerifyJob(ctx context.Context, client kubernetes.Interface, desired
 	return nil
 }
 
+// sameJobSpec compares the fields this package sets; fields defaulted by the
+// API server are ignored.
 func sameJobSpec(existing, desired batchv1.JobSpec) bool {
-	if !reflect.DeepEqual(existing.Completions, desired.Completions) || !reflect.DeepEqual(existing.Parallelism, desired.Parallelism) ||
-		!reflect.DeepEqual(existing.CompletionMode, desired.CompletionMode) || !reflect.DeepEqual(existing.BackoffLimitPerIndex, desired.BackoffLimitPerIndex) ||
-		!reflect.DeepEqual(existing.MaxFailedIndexes, desired.MaxFailedIndexes) || !reflect.DeepEqual(existing.TTLSecondsAfterFinished, desired.TTLSecondsAfterFinished) ||
-		existing.Template.Spec.RestartPolicy != desired.Template.Spec.RestartPolicy ||
-		!reflect.DeepEqual(existing.Template.Spec.AutomountServiceAccountToken, desired.Template.Spec.AutomountServiceAccountToken) ||
-		!reflect.DeepEqual(existing.Template.Spec.SecurityContext, desired.Template.Spec.SecurityContext) || !sameVolumes(existing.Template.Spec.Volumes, desired.Template.Spec.Volumes) ||
-		len(existing.Template.Spec.Containers) != len(desired.Template.Spec.Containers) || !containsLabels(existing.Template.Labels, desired.Template.Labels) {
-		return false
-	}
-	for index := range desired.Template.Spec.Containers {
-		a, b := existing.Template.Spec.Containers[index], desired.Template.Spec.Containers[index]
-		if a.Name != b.Name || a.Image != b.Image || !reflect.DeepEqual(a.Command, b.Command) || !reflect.DeepEqual(a.Args, b.Args) ||
-			!reflect.DeepEqual(a.Env, b.Env) || !apiequality.Semantic.DeepEqual(a.Resources, b.Resources) || !reflect.DeepEqual(a.VolumeMounts, b.VolumeMounts) ||
-			!reflect.DeepEqual(a.SecurityContext, b.SecurityContext) {
-			return false
-		}
-	}
-	return true
+	a, b := existing.Template.Spec, desired.Template.Spec
+	return reflect.DeepEqual(existing.Completions, desired.Completions) &&
+		reflect.DeepEqual(existing.Parallelism, desired.Parallelism) &&
+		reflect.DeepEqual(existing.CompletionMode, desired.CompletionMode) &&
+		reflect.DeepEqual(existing.BackoffLimitPerIndex, desired.BackoffLimitPerIndex) &&
+		reflect.DeepEqual(existing.MaxFailedIndexes, desired.MaxFailedIndexes) &&
+		reflect.DeepEqual(existing.ActiveDeadlineSeconds, desired.ActiveDeadlineSeconds) &&
+		reflect.DeepEqual(existing.TTLSecondsAfterFinished, desired.TTLSecondsAfterFinished) &&
+		containsLabels(existing.Template.Labels, desired.Template.Labels) &&
+		a.RestartPolicy == b.RestartPolicy &&
+		reflect.DeepEqual(a.AutomountServiceAccountToken, b.AutomountServiceAccountToken) &&
+		reflect.DeepEqual(a.EnableServiceLinks, b.EnableServiceLinks) &&
+		reflect.DeepEqual(a.SecurityContext, b.SecurityContext) &&
+		sameVolumes(a.Volumes, b.Volumes) &&
+		sameContainers(a.InitContainers, b.InitContainers) &&
+		sameContainers(a.Containers, b.Containers)
 }
 
+func sameContainers(existing, desired []corev1.Container) bool {
+	return slices.EqualFunc(existing, desired, func(a, b corev1.Container) bool {
+		return a.Name == b.Name && a.Image == b.Image &&
+			reflect.DeepEqual(a.Command, b.Command) && reflect.DeepEqual(a.Args, b.Args) && reflect.DeepEqual(a.Env, b.Env) &&
+			apiequality.Semantic.DeepEqual(a.Resources, b.Resources) &&
+			reflect.DeepEqual(a.VolumeMounts, b.VolumeMounts) && reflect.DeepEqual(a.SecurityContext, b.SecurityContext)
+	})
+}
+
+// sameVolumes compares volume sources without the defaulted projection mode.
 func sameVolumes(existing, desired []corev1.Volume) bool {
-	if len(existing) != len(desired) {
-		return false
-	}
-	for index := range desired {
-		a, b := existing[index], desired[index]
-		if a.Name != b.Name {
+	return slices.EqualFunc(existing, desired, func(a, b corev1.Volume) bool {
+		if a.Name != b.Name || !reflect.DeepEqual(a.EmptyDir, b.EmptyDir) || (a.Projected == nil) != (b.Projected == nil) {
 			return false
 		}
-		if b.EmptyDir != nil {
-			if !reflect.DeepEqual(a.EmptyDir, b.EmptyDir) {
-				return false
-			}
-			continue
-		}
-		if b.Projected == nil || a.Projected == nil || len(a.Projected.Sources) != len(b.Projected.Sources) {
-			return false
-		}
-		for source := range b.Projected.Sources {
-			if !reflect.DeepEqual(a.Projected.Sources[source], b.Projected.Sources[source]) {
-				return false
-			}
-		}
-	}
-	return true
+		return a.Projected == nil || reflect.DeepEqual(a.Projected.Sources, b.Projected.Sources)
+	})
 }
 
 func sameOwner(owners []metav1.OwnerReference, desired metav1.OwnerReference) bool {
-	for _, owner := range owners {
-		if owner.UID == desired.UID && owner.Name == desired.Name && owner.Kind == desired.Kind && owner.Controller != nil && *owner.Controller {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(owners, func(owner metav1.OwnerReference) bool {
+		return owner.UID == desired.UID && owner.Name == desired.Name && owner.Kind == desired.Kind && owner.Controller != nil && *owner.Controller
+	})
 }
 
 func containsLabels(existing, desired map[string]string) bool {
@@ -349,7 +380,11 @@ func containsLabels(existing, desired map[string]string) bool {
 	return true
 }
 
+// waitForTerminalJob watches the Job and re-reads it periodically, so a
+// dropped watch cannot hide the final state.
 func waitForTerminalJob(ctx context.Context, client kubernetes.Interface, namespace, name string) (*batchv1.Job, error) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
 	for {
 		job, err := client.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
@@ -358,71 +393,61 @@ func waitForTerminalJob(ctx context.Context, client kubernetes.Interface, namesp
 		if jobTerminal(job) {
 			return job, nil
 		}
-		watcher, err := client.BatchV1().Jobs(namespace).Watch(ctx, metav1.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.name", name).String(), ResourceVersion: job.ResourceVersion})
+		watcher, err := client.BatchV1().Jobs(namespace).Watch(ctx, metav1.ListOptions{
+			FieldSelector:   fields.OneTermEqualSelector("metadata.name", name).String(),
+			ResourceVersion: job.ResourceVersion,
+		})
 		if err != nil {
 			return nil, err
 		}
-		ticker := time.NewTicker(15 * time.Second)
-		resync := false
-		for !resync {
-			select {
-			case <-ctx.Done():
-				watcher.Stop()
-				ticker.Stop()
-				return nil, ctx.Err()
-			case <-ticker.C:
-				resync = true
-			case event, open := <-watcher.ResultChan():
-				if !open || event.Type == watch.Error {
-					resync = true
-					continue
-				}
-				updated, ok := event.Object.(*batchv1.Job)
-				if ok && updated.Name == name && jobTerminal(updated) {
-					watcher.Stop()
-					ticker.Stop()
-					return updated, nil
-				}
+		terminal, err := watchUntilResync(ctx, watcher, ticker.C, name)
+		watcher.Stop()
+		if err != nil || terminal != nil {
+			return terminal, err
+		}
+	}
+}
+
+func watchUntilResync(ctx context.Context, watcher watch.Interface, resync <-chan time.Time, name string) (*batchv1.Job, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-resync:
+			return nil, nil
+		case event, open := <-watcher.ResultChan():
+			if !open || event.Type == watch.Error {
+				return nil, nil
+			}
+			if job, ok := event.Object.(*batchv1.Job); ok && job.Name == name && jobTerminal(job) {
+				return job, nil
 			}
 		}
-		watcher.Stop()
-		ticker.Stop()
 	}
 }
 
 func jobTerminal(job *batchv1.Job) bool {
-	for _, condition := range job.Status.Conditions {
-		if condition.Status == corev1.ConditionTrue && (condition.Type == batchv1.JobComplete || condition.Type == batchv1.JobFailed) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(job.Status.Conditions, func(condition batchv1.JobCondition) bool {
+		return condition.Status == corev1.ConditionTrue && (condition.Type == batchv1.JobComplete || condition.Type == batchv1.JobFailed)
+	})
 }
 
+// summarizeJob treats every index that did not complete as failed. That
+// includes indexes that never ran because the batch deadline expired.
 func summarizeJob(job *batchv1.Job, total int, batchID string) (BatchSummary, []int, error) {
 	completed, err := ParseIndexes(job.Status.CompletedIndexes, total)
 	if err != nil {
 		return BatchSummary{}, nil, fmt.Errorf("parse completed indexes: %w", err)
 	}
-	failedValue := ""
-	if job.Status.FailedIndexes != nil {
-		failedValue = *job.Status.FailedIndexes
-	}
-	failed, err := ParseIndexes(failedValue, total)
-	if err != nil {
-		return BatchSummary{}, nil, fmt.Errorf("parse failed indexes: %w", err)
-	}
-	seen := make(map[int]struct{}, len(completed))
+	done := make([]bool, total)
 	for _, index := range completed {
-		seen[index] = struct{}{}
+		done[index] = true
 	}
-	for _, index := range failed {
-		if _, ok := seen[index]; ok {
-			return BatchSummary{}, nil, fmt.Errorf("index %d is both completed and failed", index)
+	failed := make([]int, 0, total-len(completed))
+	for index, ok := range done {
+		if !ok {
+			failed = append(failed, index)
 		}
-	}
-	if len(completed)+len(failed) != total {
-		return BatchSummary{}, nil, fmt.Errorf("terminal Job accounts for %d of %d indexes", len(completed)+len(failed), total)
 	}
 	return BatchSummary{BatchID: batchID, Total: total, Completed: len(completed), Failed: len(failed), FailedRepositoryIDs: []string{}}, failed, nil
 }

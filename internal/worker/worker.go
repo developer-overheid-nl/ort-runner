@@ -1,3 +1,7 @@
+// Package worker runs one repository of an Indexed Job. Scanning and delivery
+// are separate steps in separate containers, so code that is executed while
+// scanning a repository never shares a process or environment with the result
+// credentials.
 package worker
 
 import (
@@ -5,13 +9,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"time"
 
@@ -20,25 +22,29 @@ import (
 	"github.com/developer-overheid-nl/ort-runner/internal/runner"
 )
 
-var chunkNamePattern = regexp.MustCompile(`^chunk-([0-9]{4})-([0-9a-f]{64})\.gz$`)
+const submissionFile = "submission.json"
 
-type Config struct {
+var chunkNamePattern = regexp.MustCompile(`^chunk-([0-9]{4})-([0-9a-f]{64})\.json$`)
+
+// Delivery is retried in-process first; a failing Pod would rescan the repository.
+var deliveryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+type ScanConfig struct {
 	BatchID         string
 	CompletionIndex int
 	ManifestDir     string
-	ResultsURL      string
-	ResultsClient   register.Client
 	Runner          runner.Config
 
-	scan  func(context.Context, runner.Config) (runner.Report, error)
-	sleep func(context.Context, time.Duration) error
+	scan func(context.Context, runner.Config) (runner.Report, error)
 }
 
-type Result struct {
-	RepositoryID   string `json:"repositoryId"`
-	ScanStatus     string `json:"scanStatus"`
-	Delivery       string `json:"delivery"`
-	SubmissionPath string `json:"submissionPath"`
+type DeliverConfig struct {
+	BatchID    string
+	OutputDir  string
+	ResultsURL string
+	Client     register.Client
+
+	sleep func(context.Context, time.Duration) error
 }
 
 func ResultIdempotencyKey(batchID, repositoryID string) string {
@@ -46,23 +52,25 @@ func ResultIdempotencyKey(batchID, repositoryID string) string {
 	return "ort:" + hex.EncodeToString(sum[:])
 }
 
-func Run(ctx context.Context, cfg Config) (Result, error) {
+// Scan scans the repository at the completion index and writes its submission.
+// A failed scan is a result, not an error; errors mean the worker itself failed.
+func Scan(ctx context.Context, cfg ScanConfig) (runner.Submission, error) {
 	if cfg.BatchID == "" || cfg.ManifestDir == "" || cfg.Runner.OutputDir == "" {
-		return Result{}, fmt.Errorf("batch ID, manifest directory and output directory are required")
+		return runner.Submission{}, fmt.Errorf("batch ID, manifest directory and output directory are required")
 	}
 	manifest, err := readManifest(cfg.ManifestDir)
 	if err != nil {
-		return Result{}, err
+		return runner.Submission{}, err
 	}
 	if manifest.BatchID != cfg.BatchID {
-		return Result{}, fmt.Errorf("manifest batch ID %q does not match %q", manifest.BatchID, cfg.BatchID)
+		return runner.Submission{}, fmt.Errorf("manifest batch ID %q does not match %q", manifest.BatchID, cfg.BatchID)
 	}
 	repository, err := manifest.Repository(cfg.CompletionIndex)
 	if err != nil {
-		return Result{}, err
+		return runner.Submission{}, err
 	}
 	if err := os.MkdirAll(cfg.Runner.OutputDir, 0750); err != nil {
-		return Result{}, err
+		return runner.Submission{}, err
 	}
 
 	scan := cfg.scan
@@ -78,36 +86,66 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if report.Repository == "" {
 		report.Repository = repository.URL
 	}
-	if scanErr != nil {
-		if report.Error == "" {
-			report.Error = scanErr.Error()
-		} else if report.Error != scanErr.Error() {
-			report.Error = errors.Join(errors.New(report.Error), scanErr).Error()
-		}
+	if scanErr != nil && report.Error == "" {
+		report.Error = scanErr.Error()
 	}
+
 	submission := runner.Submission{SchemaVersion: 1, RepositoryID: repository.ID, Scan: report}
 	data, err := json.MarshalIndent(submission, "", "  ")
 	if err != nil {
-		return Result{}, err
+		return runner.Submission{}, err
 	}
-	data = append(data, '\n')
-	target := filepath.Join(cfg.Runner.OutputDir, "submission.json")
-	if err := writeAtomic(target, data); err != nil {
-		return Result{}, err
+	target := filepath.Join(cfg.Runner.OutputDir, submissionFile)
+	if err := os.WriteFile(target+".tmp", append(data, '\n'), 0600); err != nil {
+		return runner.Submission{}, err
+	}
+	if err := os.Rename(target+".tmp", target); err != nil {
+		return runner.Submission{}, err
+	}
+	slog.Info("Repository scanned", "batch_id", cfg.BatchID, "repository_id", repository.ID, "scan_status", report.Status)
+	return submission, nil
+}
+
+// Deliver posts the submission written by Scan. Without a result endpoint it
+// only logs the outcome.
+func Deliver(ctx context.Context, cfg DeliverConfig) error {
+	if cfg.BatchID == "" || cfg.OutputDir == "" {
+		return fmt.Errorf("batch ID and output directory are required")
+	}
+	data, err := os.ReadFile(filepath.Join(cfg.OutputDir, submissionFile))
+	if err != nil {
+		return fmt.Errorf("read submission: %w", err)
+	}
+	var submission runner.Submission
+	if err := json.Unmarshal(data, &submission); err != nil {
+		return fmt.Errorf("decode submission: %w", err)
+	}
+	if submission.RepositoryID == "" {
+		return fmt.Errorf("submission has no repository ID")
+	}
+	if cfg.ResultsURL == "" {
+		slog.Info("Result delivery not configured", "batch_id", cfg.BatchID, "repository_id", submission.RepositoryID, "scan_status", submission.Scan.Status)
+		return nil
 	}
 
-	result := Result{RepositoryID: repository.ID, ScanStatus: report.Status, Delivery: "not_configured", SubmissionPath: target}
-	if cfg.ResultsURL == "" {
-		slog.Info("Repository processed", "batch_id", cfg.BatchID, "repository_id", repository.ID, "scan_status", report.Status, "delivery", result.Delivery)
-		return result, nil
+	sleep := cfg.sleep
+	if sleep == nil {
+		sleep = sleepContext
 	}
-	if err := deliver(ctx, cfg, data, ResultIdempotencyKey(cfg.BatchID, repository.ID)); err != nil {
-		result.Delivery = "failed"
-		return result, err
+	key := ResultIdempotencyKey(cfg.BatchID, submission.RepositoryID)
+	for attempt := 0; ; attempt++ {
+		err = cfg.Client.PostResult(ctx, cfg.ResultsURL, data, key)
+		if err == nil {
+			slog.Info("Result delivered", "batch_id", cfg.BatchID, "repository_id", submission.RepositoryID, "scan_status", submission.Scan.Status)
+			return nil
+		}
+		if attempt == len(deliveryDelays) {
+			return fmt.Errorf("deliver result after %d attempts: %w", attempt+1, err)
+		}
+		if err := sleep(ctx, deliveryDelays[attempt]); err != nil {
+			return err
+		}
 	}
-	result.Delivery = "posted"
-	slog.Info("Repository processed", "batch_id", cfg.BatchID, "repository_id", repository.ID, "scan_status", report.Status, "delivery", result.Delivery)
-	return result, nil
 }
 
 func readManifest(directory string) (orchestration.Manifest, error) {
@@ -115,23 +153,16 @@ func readManifest(directory string) (orchestration.Manifest, error) {
 	if err != nil {
 		return orchestration.Manifest{}, fmt.Errorf("read manifest directory: %w", err)
 	}
-	names := make([]string, 0, len(entries))
+	var names []string
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if chunkNamePattern.MatchString(entry.Name()) {
+		if !entry.IsDir() && chunkNamePattern.MatchString(entry.Name()) {
 			names = append(names, entry.Name())
 		}
 	}
-	sort.Strings(names)
 	chunks := make([]orchestration.Chunk, 0, len(names))
 	for _, name := range names {
 		matches := chunkNamePattern.FindStringSubmatch(name)
-		index, err := strconv.Atoi(matches[1])
-		if err != nil {
-			return orchestration.Manifest{}, err
-		}
+		index, _ := strconv.Atoi(matches[1])
 		data, err := os.ReadFile(filepath.Join(directory, name))
 		if err != nil {
 			return orchestration.Manifest{}, err
@@ -145,30 +176,6 @@ func readManifest(directory string) (orchestration.Manifest, error) {
 	return manifest, nil
 }
 
-func deliver(ctx context.Context, cfg Config, data []byte, idempotencyKey string) error {
-	sleep := cfg.sleep
-	if sleep == nil {
-		sleep = sleepContext
-	}
-	delays := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
-	var err error
-	for attempt := 0; attempt < 5; attempt++ {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		err = cfg.ResultsClient.PostResult(ctx, cfg.ResultsURL, data, idempotencyKey)
-		if err == nil {
-			return nil
-		}
-		if attempt < len(delays) {
-			if sleepErr := sleep(ctx, delays[attempt]); sleepErr != nil {
-				return sleepErr
-			}
-		}
-	}
-	return fmt.Errorf("deliver result after 5 attempts: %w", err)
-}
-
 func sleepContext(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -178,11 +185,4 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-func writeAtomic(target string, data []byte) error {
-	if err := os.WriteFile(target+".tmp", data, 0600); err != nil {
-		return err
-	}
-	return os.Rename(target+".tmp", target)
 }

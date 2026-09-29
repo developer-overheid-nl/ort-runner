@@ -26,155 +26,173 @@ func TestResultIdempotencyKeyIsStable(t *testing.T) {
 	}
 }
 
-func TestRunPostsSuccessfulScan(t *testing.T) {
-	var submission runner.Submission
-	var key string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key = r.Header.Get("Idempotency-Key")
-		if err := json.NewDecoder(r.Body).Decode(&submission); err != nil {
-			t.Error(err)
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-	cfg := workerConfig(t, server.URL)
-	calls := 0
+func TestScanWritesSubmissionForSelectedRepository(t *testing.T) {
+	cfg := scanConfig(t)
+	var scanned string
 	cfg.scan = func(_ context.Context, scan runner.Config) (runner.Report, error) {
-		calls++
+		scanned = scan.Repository
 		return runner.Report{Status: "completed", Repository: scan.Repository}, nil
 	}
-
-	result, err := Run(context.Background(), cfg)
-	if err != nil || calls != 1 || result.RepositoryID != "repo-a" || result.Delivery != "posted" || submission.RepositoryID != "repo-a" || key != ResultIdempotencyKey("batch-1", "repo-a") {
-		t.Fatalf("result=%+v submission=%+v key=%q calls=%d err=%v", result, submission, key, calls, err)
-	}
-	assertSubmissionFile(t, cfg.Runner.OutputDir, "completed", true)
-}
-
-func TestRunTreatsScanFailureAsDeliveredRepositoryResult(t *testing.T) {
-	var submission runner.Submission
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&submission)
-		w.WriteHeader(http.StatusCreated)
-	}))
-	defer server.Close()
-	cfg := workerConfig(t, server.URL)
-	cfg.scan = func(_ context.Context, _ runner.Config) (runner.Report, error) {
-		return runner.Report{Error: "analyze failed"}, errors.New("analyze failed")
-	}
-
-	result, err := Run(context.Background(), cfg)
-	if err != nil || result.ScanStatus != "failed" || submission.Scan.Status != "failed" || submission.Scan.Error != "analyze failed" {
-		t.Fatalf("result=%+v submission=%+v err=%v", result, submission, err)
-	}
-}
-
-func TestRunWithoutResultsEndpointKeepsSubmission(t *testing.T) {
-	cfg := workerConfig(t, "")
-	cfg.scan = func(_ context.Context, scan runner.Config) (runner.Report, error) {
-		return runner.Report{Status: "completed", Repository: scan.Repository}, nil
-	}
-	result, err := Run(context.Background(), cfg)
-	if err != nil || result.Delivery != "not_configured" {
-		t.Fatalf("result=%+v err=%v", result, err)
-	}
-	assertSubmissionFile(t, cfg.Runner.OutputDir, "completed", true)
-}
-
-func TestRunRetriesDeliveryWithoutRescanning(t *testing.T) {
-	attempts := 0
-	var keys []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		keys = append(keys, r.Header.Get("Idempotency-Key"))
-		if attempts < 3 {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-	cfg := workerConfig(t, server.URL)
-	scans := 0
-	cfg.scan = func(_ context.Context, scan runner.Config) (runner.Report, error) {
-		scans++
-		return runner.Report{Status: "completed", Repository: scan.Repository}, nil
-	}
-	var delays []time.Duration
-	cfg.sleep = func(_ context.Context, delay time.Duration) error { delays = append(delays, delay); return nil }
-	if _, err := Run(context.Background(), cfg); err != nil {
+	if _, err := Scan(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	if scans != 1 || attempts != 3 || !slices.Equal(delays, []time.Duration{time.Second, 2 * time.Second}) || keys[0] != keys[1] || keys[1] != keys[2] {
-		t.Fatalf("scans=%d attempts=%d delays=%v keys=%v", scans, attempts, delays, keys)
+	submission := readSubmission(t, cfg.Runner.OutputDir)
+	if scanned != "https://example.test/a.git" || submission.RepositoryID != "repo-a" || submission.Scan.Status != "completed" {
+		t.Fatalf("scanned=%q submission=%+v", scanned, submission)
 	}
 }
 
-func TestRunReturnsInfrastructureErrorAfterDeliveryRetries(t *testing.T) {
-	attempts := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-	cfg := workerConfig(t, server.URL)
-	cfg.scan = func(_ context.Context, scan runner.Config) (runner.Report, error) {
-		return runner.Report{Status: "completed", Repository: scan.Repository}, nil
+func TestScanTreatsRepositoryFailureAsResult(t *testing.T) {
+	cfg := scanConfig(t)
+	cfg.scan = func(context.Context, runner.Config) (runner.Report, error) {
+		return runner.Report{}, errors.New("analyze failed")
 	}
-	cfg.sleep = func(context.Context, time.Duration) error { return nil }
-	if _, err := Run(context.Background(), cfg); err == nil || attempts != 5 {
-		t.Fatalf("attempts=%d err=%v", attempts, err)
+	if _, err := Scan(context.Background(), cfg); err != nil {
+		t.Fatalf("repository failure failed the worker: %v", err)
+	}
+	submission := readSubmission(t, cfg.Runner.OutputDir)
+	if submission.Scan.Status != "failed" || submission.Scan.Error != "analyze failed" || submission.Scan.Repository == "" {
+		t.Fatalf("submission=%+v", submission)
 	}
 }
 
-func TestRunRejectsInvalidManifestSelectionBeforeScan(t *testing.T) {
+func TestScanRejectsInvalidManifestSelection(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		mutate func(*Config)
+		mutate func(*ScanConfig)
 	}{
-		{name: "negative index", mutate: func(cfg *Config) { cfg.CompletionIndex = -1 }},
-		{name: "out of range", mutate: func(cfg *Config) { cfg.CompletionIndex = 1 }},
-		{name: "batch mismatch", mutate: func(cfg *Config) { cfg.BatchID = "other" }},
+		{name: "negative index", mutate: func(cfg *ScanConfig) { cfg.CompletionIndex = -1 }},
+		{name: "out of range", mutate: func(cfg *ScanConfig) { cfg.CompletionIndex = 1 }},
+		{name: "batch mismatch", mutate: func(cfg *ScanConfig) { cfg.BatchID = "other" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := workerConfig(t, "")
+			cfg := scanConfig(t)
 			called := false
 			cfg.scan = func(context.Context, runner.Config) (runner.Report, error) {
 				called = true
 				return runner.Report{}, nil
 			}
 			tc.mutate(&cfg)
-			if _, err := Run(context.Background(), cfg); err == nil || called {
+			if _, err := Scan(context.Background(), cfg); err == nil || called {
 				t.Fatalf("invalid selection reached scan: called=%t err=%v", called, err)
 			}
 		})
 	}
 }
 
-func workerConfig(t *testing.T, resultsURL string) Config {
+func TestDeliverPostsWithIdempotencyKey(t *testing.T) {
+	var key string
+	var posted runner.Submission
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key = r.Header.Get("Idempotency-Key")
+		if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	cfg := deliverConfig(t, server.URL)
+	if err := Deliver(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if posted.RepositoryID != "repo-a" || key != ResultIdempotencyKey("batch-1", "repo-a") {
+		t.Fatalf("posted=%+v key=%q", posted, key)
+	}
+}
+
+func TestDeliverWithoutEndpointOnlyLogs(t *testing.T) {
+	cfg := deliverConfig(t, "")
+	if err := Deliver(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeliverRetriesWithSameKey(t *testing.T) {
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		if len(keys) < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	cfg := deliverConfig(t, server.URL)
+	var delays []time.Duration
+	cfg.sleep = func(_ context.Context, delay time.Duration) error { delays = append(delays, delay); return nil }
+	if err := Deliver(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 3 || keys[0] != keys[2] || !slices.Equal(delays, []time.Duration{time.Second, 2 * time.Second}) {
+		t.Fatalf("keys=%v delays=%v", keys, delays)
+	}
+}
+
+func TestDeliverFailsAfterRetries(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	cfg := deliverConfig(t, server.URL)
+	cfg.sleep = func(context.Context, time.Duration) error { return nil }
+	if err := Deliver(context.Background(), cfg); err == nil || attempts != len(deliveryDelays)+1 {
+		t.Fatalf("attempts=%d err=%v", attempts, err)
+	}
+}
+
+func TestDeliverRejectsMissingSubmission(t *testing.T) {
+	cfg := DeliverConfig{BatchID: "batch-1", OutputDir: t.TempDir()}
+	if err := Deliver(context.Background(), cfg); err == nil {
+		t.Fatal("missing submission accepted")
+	}
+}
+
+func scanConfig(t *testing.T) ScanConfig {
 	t.Helper()
 	manifestDir := t.TempDir()
-	chunks, err := orchestration.EncodeManifest(orchestration.Manifest{SchemaVersion: 1, BatchID: "batch-1", Repositories: []register.Repository{{ID: "repo-a", URL: "https://example.test/a.git"}}}, 1<<20)
+	manifest, err := orchestration.NewManifest("batch-1", []register.Repository{{ID: "repo-a", URL: "https://example.test/a.git"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := orchestration.EncodeManifest(manifest, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, chunk := range chunks {
-		name := fmt.Sprintf("chunk-%04d-%s.gz", chunk.Index, chunk.Digest)
+		name := fmt.Sprintf("chunk-%04d-%s.json", chunk.Index, chunk.Digest)
 		if err := os.WriteFile(filepath.Join(manifestDir, name), chunk.Data, 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return Config{
-		BatchID: "batch-1", CompletionIndex: 0, ManifestDir: manifestDir, ResultsURL: resultsURL,
-		ResultsClient: register.Client{HTTP: http.DefaultClient},
-		Runner:        runner.Config{OutputDir: t.TempDir(), ConfigDir: t.TempDir(), StageTimeout: time.Minute},
-		sleep:         func(context.Context, time.Duration) error { t.Fatal("unexpected retry"); return nil },
+	return ScanConfig{
+		BatchID: "batch-1", ManifestDir: manifestDir,
+		Runner: runner.Config{OutputDir: t.TempDir(), ConfigDir: t.TempDir(), StageTimeout: time.Minute},
 	}
 }
 
-func assertSubmissionFile(t *testing.T, outputDir, status string, equal bool) {
+func deliverConfig(t *testing.T, resultsURL string) DeliverConfig {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(outputDir, "submission.json"))
+	outputDir := t.TempDir()
+	data, err := json.Marshal(runner.Submission{SchemaVersion: 1, RepositoryID: "repo-a", Scan: runner.Report{Status: "completed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, submissionFile), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return DeliverConfig{
+		BatchID: "batch-1", OutputDir: outputDir, ResultsURL: resultsURL,
+		Client: register.Client{HTTP: http.DefaultClient},
+		sleep:  func(context.Context, time.Duration) error { t.Fatal("unexpected retry"); return nil },
+	}
+}
+
+func readSubmission(t *testing.T, outputDir string) runner.Submission {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(outputDir, submissionFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +200,5 @@ func assertSubmissionFile(t *testing.T, outputDir, status string, equal bool) {
 	if err := json.Unmarshal(data, &submission); err != nil {
 		t.Fatal(err)
 	}
-	if (submission.Scan.Status == status) != equal {
-		t.Fatalf("submission status=%q want comparison %t with %q", submission.Scan.Status, equal, status)
-	}
+	return submission
 }

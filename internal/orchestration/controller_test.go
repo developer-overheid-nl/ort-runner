@@ -83,12 +83,6 @@ func TestRunControllerCreatesAndAdoptsIndexedBatch(t *testing.T) {
 			job.Spec.Template.Spec.Volumes[index].Projected.DefaultMode = &defaultMode
 		}
 	}
-	for index := range job.Spec.Template.Spec.Containers[0].Env {
-		field := job.Spec.Template.Spec.Containers[0].Env[index].ValueFrom
-		if field != nil && field.FieldRef != nil {
-			field.FieldRef.APIVersion = "v1"
-		}
-	}
 	if _, err := client.BatchV1().Jobs("oss").Update(context.Background(), job, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +118,10 @@ func TestRunControllerRejectsConflictingResources(t *testing.T) {
 		{name: "image", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { job.Spec.Template.Spec.Containers[0].Image = "other" }},
 		{name: "completions", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.Completions = 2 }},
 		{name: "cleanup TTL", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.TTLSecondsAfterFinished = 60 }},
+		{name: "deadline", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.ActiveDeadlineSeconds = 60 }},
+		{name: "scan image", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) {
+			job.Spec.Template.Spec.InitContainers[0].Image = "other"
+		}},
 		{name: "environment", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) {
 			job.Spec.Template.Spec.Containers[0].Env[0].Value = "other"
 		}},
@@ -168,6 +166,67 @@ func TestRunControllerReportsTerminalFailedIndex(t *testing.T) {
 	}
 	if !slices.Equal(reporter.repositories, []string{"b"}) {
 		t.Fatalf("reported=%v", reporter.repositories)
+	}
+}
+
+func TestRunControllerRestartKeepsStoredManifestWhenRegisterChanges(t *testing.T) {
+	requests := 0
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Total-Pages", "1")
+		fmt.Fprint(w, `[{"id":"a","url":"https://example.test/a.git"}]`)
+	}))
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	cfg := controllerConfig(t, server.URL)
+	// A first attempt that stopped after storing its batch resources.
+	manifest, err := NewManifest(cfg.BatchName, repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := EncodeManifest(manifest, manifestChunkLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := controllerPod().OwnerReferences[0]
+	maps, err := BuildConfigMaps(owner, "oss", WorkerResources{
+		Image: "ghcr.io/example/ort-runner@sha256:1234", BatchID: cfg.BatchName, RepositoryCount: 1,
+		ConfigData: map[string][]byte{"evaluator.rules.kts": []byte("licenseRule {}")}, ManifestChunks: chunks, Settings: cfg.Settings,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, configMap := range maps {
+		if _, err := client.CoreV1().ConfigMaps("oss").Create(context.Background(), configMap, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The register gained a repository in the meantime.
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Total-Pages", "1")
+		fmt.Fprint(w, `[{"id":"a","url":"https://example.test/a.git"},{"id":"b","url":"https://example.test/b.git"}]`)
+	})
+	completeNextJob(t, client, "0", "", batchv1.JobComplete)
+
+	summary, err := RunController(context.Background(), client, cfg)
+	if err != nil || summary.Total != 1 || summary.Completed != 1 || requests != 0 {
+		t.Fatalf("summary=%+v requests=%d err=%v", summary, requests, err)
+	}
+}
+
+func TestRunControllerCountsUnfinishedIndexesAsFailed(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}, {ID: "b", URL: "https://example.test/b.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	// Deadline exceeded: index 1 never ran, so it is neither completed nor failed.
+	completeNextJob(t, client, "0", "", batchv1.JobFailed)
+
+	summary, err := RunController(context.Background(), client, controllerConfig(t, server.URL))
+	if err != nil || summary.Completed != 1 || summary.Failed != 1 || !slices.Equal(summary.FailedRepositoryIDs, []string{"b"}) {
+		t.Fatalf("summary=%+v err=%v", summary, err)
 	}
 }
 
@@ -242,9 +301,8 @@ func controllerConfig(t *testing.T, repositoriesURL string) ControllerConfig {
 	}
 	return ControllerConfig{
 		Namespace: "oss", PodName: "controller-pod", ContainerName: "ort-runner", BatchName: "batch-1",
-		RepositoriesURL: repositoriesURL, ConfigDir: configDir, Parallelism: 10, RetryLimit: 1,
-		WorkerResources: WorkerResources{CPURequest: "200m", CPULimit: "2000m", MemoryRequest: "4Gi", MemoryLimit: "8Gi"},
-		RegisterClient:  register.Client{HTTP: http.DefaultClient},
+		RepositoriesURL: repositoriesURL, ConfigDir: configDir, Settings: testSettings(),
+		RegisterClient: register.Client{HTTP: http.DefaultClient},
 	}
 }
 

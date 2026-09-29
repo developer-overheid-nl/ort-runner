@@ -339,7 +339,7 @@ func TestRegisterCredentialsDoNotReachScannedProcesses(t *testing.T) {
 	cfg := setup(t, "completed")
 	for _, name := range []string{
 		"ORT_REGISTER_API_KEY", "AUTH_TOKEN_URL", "AUTH_CLIENT_ID", "AUTH_CLIENT_SECRET", "AUTH_SCOPES",
-		"KEYCLOAK_BASE_URL", "KEYCLOAK_REALM", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT",
+		"KEYCLOAK_BASE_URL", "KEYCLOAK_REALM",
 	} {
 		t.Setenv(name, "test-credential")
 	}
@@ -347,7 +347,7 @@ func TestRegisterCredentialsDoNotReachScannedProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	guard := "set -eu\ntest -z \"${ORT_REGISTER_API_KEY:-}${AUTH_TOKEN_URL:-}${AUTH_CLIENT_ID:-}${AUTH_CLIENT_SECRET:-}${AUTH_SCOPES:-}${KEYCLOAK_BASE_URL:-}${KEYCLOAK_REALM:-}${KUBERNETES_SERVICE_HOST:-}${KUBERNETES_SERVICE_PORT:-}\""
+	guard := "set -eu\ntest -z \"${ORT_REGISTER_API_KEY:-}${AUTH_TOKEN_URL:-}${AUTH_CLIENT_ID:-}${AUTH_CLIENT_SECRET:-}${AUTH_SCOPES:-}${KEYCLOAK_BASE_URL:-}${KEYCLOAK_REALM:-}\""
 	write(t, cfg.ORTBinary, strings.Replace(string(script), "set -eu", guard, 1))
 	if _, err := Run(context.Background(), cfg); err != nil {
 		t.Fatal(err)

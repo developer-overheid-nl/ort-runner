@@ -9,10 +9,13 @@ import (
 )
 
 func TestManifestRoundTripAcrossChunks(t *testing.T) {
-	input := Manifest{SchemaVersion: 1, BatchID: "batch-1", Repositories: []register.Repository{
+	input, err := NewManifest("batch-1", []register.Repository{
 		{ID: "b", URL: "https://example.test/b.git"},
 		{ID: "a", URL: "https://example.test/a.git"},
-	}}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	limit := singleRepositoryChunkLimit(t, input)
 	chunks, err := EncodeManifest(input, limit)
 	if err != nil || len(chunks) < 2 {
@@ -103,7 +106,8 @@ func singleRepositoryChunkLimit(t *testing.T, manifest Manifest) int {
 		}
 		limit = max(limit, len(chunks[0].Data))
 	}
-	return limit
+	// Room for one record plus the separator, but not for two records.
+	return limit + 16
 }
 
 func TestManifestRepositoryRejectsInvalidIndexes(t *testing.T) {

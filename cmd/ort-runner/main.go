@@ -15,13 +15,11 @@ import (
 	"time"
 
 	commonauth "github.com/developer-overheid-nl/don-register-common/auth"
+	"github.com/developer-overheid-nl/ort-runner/internal/register"
 	"github.com/developer-overheid-nl/ort-runner/internal/runner"
 )
 
 var version = "dev"
-
-var controllerCommand = unavailableSubcommand("controller")
-var workerCommand = unavailableSubcommand("worker")
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
@@ -30,36 +28,26 @@ func main() {
 	os.Exit(execute(ctx, os.Args[1:], os.Stdout, os.Stderr))
 }
 
+// execute dispatches the Kubernetes commands; everything else is a local scan.
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	switch first(args) {
-	case "controller":
-		return controllerCommand(ctx, args[1:], stdout, stderr)
-	case "worker":
-		return workerCommand(ctx, args[1:], stdout, stderr)
-	default:
-		return executeLegacy(ctx, args, stdout, stderr)
+	if len(args) > 0 {
+		switch args[0] {
+		case "controller":
+			return executeController(ctx, args[1:], stdout, stderr)
+		case "worker":
+			return executeWorker(ctx, args[1:], stdout, stderr)
+		case "deliver":
+			return executeDeliver(ctx, args[1:], stdout, stderr)
+		}
 	}
+	return executeLocal(ctx, args, stdout, stderr)
 }
 
-func unavailableSubcommand(name string) func(context.Context, []string, io.Writer, io.Writer) int {
-	return func(_ context.Context, _ []string, _ io.Writer, stderr io.Writer) int {
-		fmt.Fprintf(stderr, "%s is only available when the complete ort-runner package is built\n", name)
-		return 2
-	}
-}
-
-func first(args []string) string {
-	if len(args) == 0 {
-		return ""
-	}
-	return args[0]
-}
-
-func executeLegacy(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func executeLocal(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("ort-runner", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	cfg := runner.Config{RunnerVersion: version, ORTImage: os.Getenv("ORT_RUNNER_ORT_IMAGE")}
-	batch := runner.BatchConfig{RegisterAPIKey: os.Getenv("ORT_REGISTER_API_KEY")}
+	batch := runner.BatchConfig{RegisterAPIKey: os.Getenv(register.APIKeyVariable)}
 	flags.StringVar(&batch.RepositoriesURL, "repositories-url", os.Getenv("ORT_REPOSITORIES_URL"), "OSS-register GET endpoint; processes all repositories")
 	flags.StringVar(&batch.ResultsURL, "results-url", os.Getenv("ORT_RESULTS_URL"), "Result POST endpoint; omitted means save messages locally")
 	flags.DurationVar(&batch.HTTPTimeout, "http-timeout", 30*time.Second, "Timeout per register GET or result POST")

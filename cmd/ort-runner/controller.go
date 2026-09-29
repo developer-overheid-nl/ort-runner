@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,19 +21,41 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+const controllerUsage = `Usage: ort-runner controller
+
+Creates one Kubernetes Indexed Job for all register repositories and waits for it.
+Configured through the environment:
+
+  POD_NAMESPACE, POD_NAME          controller Pod (downward API)
+  ORT_BATCH_ID                     stable batch identifier (controller Job name)
+  ORT_REPOSITORIES_URL             OSS-register GET endpoint
+  ORT_REGISTER_API_KEY             API key for the register GET
+  ORT_RESULTS_URL                  result POST endpoint; empty disables delivery
+  AUTH_TOKEN_URL, AUTH_CLIENT_ID,
+  AUTH_CLIENT_SECRET, AUTH_SCOPES  OAuth client credentials for result delivery
+  ORT_CONFIG_DIR                   directory with evaluator.rules.kts
+  ORT_PARALLELISM                  concurrent workers, 1-100 (default 10)
+  ORT_BATCH_DEADLINE               maximum batch duration (default 46h)
+  ORT_WORKER_CPU_REQUEST/LIMIT     (default 200m / 2000m)
+  ORT_WORKER_MEMORY_REQUEST/LIMIT  (default 4Gi / 8Gi)
+  ORT_WORKER_EPHEMERAL_STORAGE_REQUEST/LIMIT  (default 10Gi / 30Gi)
+`
+
+// Kubernetes 1.33 is the first release with stable backoffLimitPerIndex.
+const minimumKubernetesMinor = 33
+
 var controllerDependencies = newControllerDependencies
 
-func init() {
-	controllerCommand = executeController
-}
-
 func executeController(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	parallelism, err := envInt32("ORT_PARALLELISM", 10)
+	if code, done := internalCommandArgs(args, controllerUsage, stdout, stderr); done {
+		return code
+	}
+	parallelism, err := strconv.ParseInt(envDefault("ORT_PARALLELISM", "10"), 10, 32)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "ORT_PARALLELISM must be an integer")
 		return 2
 	}
-	retryLimit, err := envInt32("ORT_REPOSITORY_RETRY_LIMIT", 1)
+	deadline, err := envDuration("ORT_BATCH_DEADLINE", 46*time.Hour)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -44,40 +65,41 @@ func executeController(ctx context.Context, args []string, stdout, stderr io.Wri
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-
-	flags := flag.NewFlagSet("ort-runner controller", flag.ContinueOnError)
-	flags.SetOutput(stderr)
 	cfg := orchestration.ControllerConfig{
-		Namespace: os.Getenv("POD_NAMESPACE"), PodName: os.Getenv("POD_NAME"), ContainerName: envDefault("ORT_CONTROLLER_CONTAINER", "ort-runner"),
-		BatchName: os.Getenv("ORT_BATCH_ID"), RepositoriesURL: os.Getenv("ORT_REPOSITORIES_URL"), ResultsURL: os.Getenv("ORT_RESULTS_URL"),
-		ConfigDir: os.Getenv("ORT_CONFIG_DIR"), Parallelism: parallelism, RetryLimit: retryLimit,
+		Namespace:       os.Getenv("POD_NAMESPACE"),
+		PodName:         os.Getenv("POD_NAME"),
+		ContainerName:   envDefault("ORT_CONTROLLER_CONTAINER", "ort-runner"),
+		BatchName:       os.Getenv("ORT_BATCH_ID"),
+		RepositoriesURL: os.Getenv("ORT_REPOSITORIES_URL"),
+		ResultsURL:      os.Getenv(register.ResultsURLVariable),
+		ConfigDir:       os.Getenv("ORT_CONFIG_DIR"),
+		Settings: orchestration.WorkerSettings{
+			Parallelism:             int32(parallelism),
+			Deadline:                deadline,
+			CPURequest:              envDefault("ORT_WORKER_CPU_REQUEST", "200m"),
+			CPULimit:                envDefault("ORT_WORKER_CPU_LIMIT", "2000m"),
+			MemoryRequest:           envDefault("ORT_WORKER_MEMORY_REQUEST", "4Gi"),
+			MemoryLimit:             envDefault("ORT_WORKER_MEMORY_LIMIT", "8Gi"),
+			EphemeralStorageRequest: envDefault("ORT_WORKER_EPHEMERAL_STORAGE_REQUEST", "10Gi"),
+			EphemeralStorageLimit:   envDefault("ORT_WORKER_EPHEMERAL_STORAGE_LIMIT", "30Gi"),
+		},
+		RegisterClient: register.Client{HTTP: &http.Client{Timeout: httpTimeout}, APIKey: os.Getenv(register.APIKeyVariable)},
 	}
-	parallelismFlag := int(cfg.Parallelism)
-	retryLimitFlag := int(cfg.RetryLimit)
-	flags.StringVar(&cfg.Namespace, "namespace", cfg.Namespace, "Kubernetes namespace")
-	flags.StringVar(&cfg.PodName, "pod-name", cfg.PodName, "Controller Pod name")
-	flags.StringVar(&cfg.ContainerName, "container-name", cfg.ContainerName, "Controller container name")
-	flags.StringVar(&cfg.BatchName, "batch-id", cfg.BatchName, "Stable batch identifier")
-	flags.StringVar(&cfg.RepositoriesURL, "repositories-url", cfg.RepositoriesURL, "OSS-register GET endpoint")
-	flags.StringVar(&cfg.ResultsURL, "results-url", cfg.ResultsURL, "Result POST endpoint")
-	flags.StringVar(&cfg.ConfigDir, "config-dir", cfg.ConfigDir, "Directory containing the ORT configuration")
-	flags.IntVar(&parallelismFlag, "parallelism", parallelismFlag, "Concurrent repository workers (1-100)")
-	flags.IntVar(&retryLimitFlag, "retry-limit", retryLimitFlag, "Retries per repository; must equal 1")
-	if err := flags.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
+	if cfg.Namespace == "" || cfg.PodName == "" || cfg.BatchName == "" || cfg.RepositoriesURL == "" || cfg.ConfigDir == "" {
+		fmt.Fprintln(stderr, "POD_NAMESPACE, POD_NAME, ORT_BATCH_ID, ORT_REPOSITORIES_URL and ORT_CONFIG_DIR are required.")
+		return 2
+	}
+	if err := cfg.Settings.Validate(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if cfg.ResultsURL != "" {
+		resultsHTTP, err := newResultsHTTPClient(ctx, httpTimeout)
+		if err != nil {
+			fmt.Fprintf(stderr, "Configure result credentials: %v\n", err)
+			return 2
 		}
-		return 2
-	}
-	if parallelismFlag < 1 || parallelismFlag > 100 || retryLimitFlag != 1 {
-		fmt.Fprintln(stderr, "Controller requires parallelism 1-100 and retry limit 1.")
-		return 2
-	}
-	cfg.Parallelism = int32(parallelismFlag)
-	cfg.RetryLimit = int32(retryLimitFlag)
-	if flags.NArg() != 0 || cfg.Namespace == "" || cfg.PodName == "" || cfg.ContainerName == "" || cfg.BatchName == "" || cfg.RepositoriesURL == "" || cfg.ConfigDir == "" || cfg.RetryLimit != 1 || cfg.Parallelism < 1 || cfg.Parallelism > 100 {
-		fmt.Fprintln(stderr, "Controller requires namespace, Pod name, batch ID, repositories URL, config directory, parallelism 1-100 and retry limit 1.")
-		return 2
+		cfg.FailureReporter = failedIndexReporter{endpoint: cfg.ResultsURL, client: register.Client{HTTP: resultsHTTP}}
 	}
 
 	client, serverVersion, err := controllerDependencies()
@@ -85,23 +107,10 @@ func executeController(ctx context.Context, args []string, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "Configure Kubernetes client: %v\n", err)
 		return 1
 	}
-	if err := requireKubernetes133(serverVersion); err != nil {
+	if err := requireSupportedKubernetes(serverVersion); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	base := &http.Client{Timeout: httpTimeout}
-	cfg.RegisterClient = register.Client{HTTP: base, APIKey: os.Getenv("ORT_REGISTER_API_KEY")}
-	resultsHTTP, err := newResultsHTTPClient(ctx, httpTimeout)
-	if err != nil {
-		fmt.Fprintf(stderr, "Configure result credentials: %v\n", err)
-		return 2
-	}
-	cfg.ResultsClient = register.Client{HTTP: resultsHTTP}
-	cfg.WorkerResources = orchestration.WorkerResources{
-		CPURequest: envDefault("ORT_WORKER_CPU_REQUEST", "200m"), CPULimit: envDefault("ORT_WORKER_CPU_LIMIT", "2000m"),
-		MemoryRequest: envDefault("ORT_WORKER_MEMORY_REQUEST", "4Gi"), MemoryLimit: envDefault("ORT_WORKER_MEMORY_LIMIT", "8Gi"),
-	}
-	cfg.FailureReporter = failedIndexReporter{endpoint: cfg.ResultsURL, client: cfg.ResultsClient}
 	summary, err := orchestration.RunController(ctx, client, cfg)
 	if encodeErr := json.NewEncoder(stdout).Encode(summary); encodeErr != nil && err == nil {
 		err = encodeErr
@@ -133,15 +142,15 @@ func newControllerDependencies() (kubernetes.Interface, *k8sversion.Info, error)
 	return client, serverVersion, nil
 }
 
-func requireKubernetes133(info *k8sversion.Info) error {
+func requireSupportedKubernetes(info *k8sversion.Info) error {
 	if info == nil {
-		return fmt.Errorf("Kubernetes server version is unavailable; version 1.33 or newer is required")
+		return fmt.Errorf("Kubernetes server version is unavailable; version 1.%d or newer is required", minimumKubernetesMinor)
 	}
-	major, majorErr := strconv.Atoi(strings.TrimRightFunc(info.Major, func(r rune) bool { return r < '0' || r > '9' }))
-	minorText := strings.TrimRightFunc(info.Minor, func(r rune) bool { return r < '0' || r > '9' })
-	minor, minorErr := strconv.Atoi(minorText)
-	if majorErr != nil || minorErr != nil || major != 1 || minor < 33 {
-		return fmt.Errorf("Kubernetes server %s is unsupported; version 1.33 or newer is required", info.GitVersion)
+	// Managed clusters report minors such as "33+".
+	major, majorErr := strconv.Atoi(info.Major)
+	minor, minorErr := strconv.Atoi(strings.TrimSuffix(info.Minor, "+"))
+	if majorErr != nil || minorErr != nil || major != 1 || minor < minimumKubernetesMinor {
+		return fmt.Errorf("Kubernetes server %s is unsupported; version 1.%d or newer is required", info.GitVersion, minimumKubernetesMinor)
 	}
 	return nil
 }
@@ -151,10 +160,12 @@ type failedIndexReporter struct {
 	client   register.Client
 }
 
+// ReportFailedIndex records a repository whose worker Pod never delivered a
+// result, for example after two OOM kills or an expired batch deadline.
 func (reporter failedIndexReporter) ReportFailedIndex(ctx context.Context, batchID string, repository register.Repository) error {
 	now := time.Now().UTC()
 	submission := runner.Submission{SchemaVersion: 1, RepositoryID: repository.ID, Scan: runner.Report{
-		SchemaVersion: 1, Status: "failed", Error: "worker failed after Kubernetes retry", Repository: repository.URL,
+		SchemaVersion: 1, Status: "failed", Error: "repository scan did not finish", Repository: repository.URL,
 		StartedAt: now, FinishedAt: &now, Findings: []runner.Finding{}, Vulnerabilities: []runner.Vulnerability{}, Stages: []runner.Stage{},
 	}}
 	data, err := json.Marshal(submission)
@@ -164,23 +175,25 @@ func (reporter failedIndexReporter) ReportFailedIndex(ctx context.Context, batch
 	return reporter.client.PostResult(ctx, reporter.endpoint, data, worker.ResultIdempotencyKey(batchID, repository.ID))
 }
 
+// internalCommandArgs handles --help; the Kubernetes commands take no arguments.
+func internalCommandArgs(args []string, usage string, stdout, stderr io.Writer) (int, bool) {
+	switch {
+	case len(args) == 0:
+		return 0, false
+	case len(args) == 1 && (args[0] == "-h" || args[0] == "--help"):
+		fmt.Fprint(stdout, usage)
+		return 0, true
+	default:
+		fmt.Fprint(stderr, usage)
+		return 2, true
+	}
+}
+
 func envDefault(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
 		return value
 	}
 	return fallback
-}
-
-func envInt32(name string, fallback int32) (int32, error) {
-	value := os.Getenv(name)
-	if value == "" {
-		return fallback, nil
-	}
-	parsed, err := strconv.ParseInt(value, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer", name)
-	}
-	return int32(parsed), nil
 }
 
 func envDuration(name string, fallback time.Duration) (time.Duration, error) {

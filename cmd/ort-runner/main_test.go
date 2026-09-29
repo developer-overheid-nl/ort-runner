@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -108,13 +107,5 @@ func TestHelpDoesNotStartScan(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "-revision") {
 		t.Fatal("help does not explain revision input")
-	}
-}
-
-func TestMainGoStillRunsLegacyCLI(t *testing.T) {
-	command := exec.Command("go", "run", "main.go", "--help")
-	output, err := command.CombinedOutput()
-	if err != nil || !strings.Contains(string(output), "-revision") {
-		t.Fatalf("go run main.go no longer supports the legacy CLI: %v\n%s", err, output)
 	}
 }

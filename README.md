@@ -13,8 +13,9 @@ of een volledige sequentiële batch verwerken.
 In Kubernetes start een geplande controller één Indexed Job. Iedere worker-Pod
 verwerkt precies één repository. Daardoor kan een zwaar project alleen zijn eigen
 worker laten mislukken en begint een herstart van de controller niet opnieuw bij
-repository één. `controller` en `worker` zijn interne deploymentcommando's; voor
-lokaal gebruik blijven `--repository` en `--repositories-url` de ingangen.
+repository één. `controller`, `worker` en `deliver` zijn interne
+deploymentcommando's; lokaal start je de runner met `go run ./cmd/ort-runner` en
+blijven `--repository` en `--repositories-url` de ingangen.
 
 ## Repositories uit het register verwerken
 
@@ -130,17 +131,33 @@ de POST maximaal vijf keer; de scan zelf wordt daarbij niet herhaald.
 ## Kubernetes-uitvoering
 
 De Kubernetes-uitvoering vereist serverversie **1.33 of nieuwer** vanwege
-`backoffLimitPerIndex`. De controller leest de repositorylijst één keer, maakt een
-onveranderlijk snapshot van de lijst en de ORT-configuratie en start standaard tien
-workers tegelijk. Kubernetes bewaart de voortgang in de Indexed Job; er is geen
-aparte database of queue.
+`backoffLimitPerIndex`. Een eerste controllerpoging leest de repositorylijst en
+slaat die met de ORT-configuratie op in onveranderlijke ConfigMaps. Een herstarte
+controller gebruikt die opgeslagen lijst, ook als het register intussen is
+gewijzigd. Kubernetes bewaart de voortgang in de Indexed Job; er is geen aparte
+database of queue.
 
-Een worker vraagt standaard `200m` CPU en `4Gi` geheugen aan, met limieten van
-`2000m` en `8Gi`. Binnen die grens krijgt ORT maximaal `4Gi` Java-heap. De door de
-worker gemounte Gradle-config begrenst Gradle op `2Gi` heap en `512Mi` metaspace,
-ook als een gescande repository hogere waarden bevat. Een mislukte index krijgt
-precies één nieuwe Pod. Daarna komt die index in `failedIndexes`; andere indexen
-gaan door. Afgeronde worker Jobs en hun Pods worden na 24 uur opgeruimd.
+Een worker-Pod heeft twee stappen:
+
+1. **Scan** (`ort-runner worker`, init-container): checkout en ORT. Deze stap voert
+   code van de gescande repository uit en krijgt daarom geen credentials,
+   ServiceAccount-token of service-links.
+2. **Levering** (`ort-runner deliver`, kleine container): stuurt `submission.json`
+   met een vaste idempotency-key (`ort:<sha256>`) naar `ORT_RESULTS_URL` en probeert
+   dat maximaal vijf keer. Alleen deze stap krijgt de OAuth-gegevens.
+
+De scan vraagt standaard `200m` CPU, `4Gi` geheugen en `10Gi` tijdelijke opslag
+aan, met limieten van `2000m`, `8Gi` en `30Gi`. Binnen die grens krijgt ORT
+maximaal `4Gi` Java-heap. De gemounte Gradle-config begrenst Gradle op `2Gi` heap
+en `512Mi` metaspace, ook als een gescande repository hogere waarden bevat. Een
+Pod die zijn geheugen- of opslaglimiet overschrijdt, raakt alleen zijn eigen
+repository.
+
+Een mislukte index krijgt precies één nieuwe Pod; daarna gaan de andere indexen
+door. Na `ORT_BATCH_DEADLINE` stopt Kubernetes de batch. Alle indexen die niet zijn
+afgerond, ook indexen die nooit zijn gestart, gelden dan als mislukt en worden bij
+een ingesteld resultaatendpoint als mislukt gemeld. Afgeronde worker Jobs en hun
+Pods worden na 24 uur opgeruimd.
 
 ```sh
 kubectl -n tn-don-oss-test get job <worker-job> \
@@ -149,21 +166,17 @@ kubectl -n tn-don-oss-test get job <worker-job> \
 
 De belangrijkste controllerwaarden zijn:
 
-| Omgevingsvariabele | Standaard in test |
+| Omgevingsvariabele | Standaard |
 | --- | --- |
 | `ORT_PARALLELISM` | `10` |
-| `ORT_REPOSITORY_RETRY_LIMIT` | `1` |
+| `ORT_BATCH_DEADLINE` | `46h` |
 | `ORT_WORKER_CPU_REQUEST` / `ORT_WORKER_CPU_LIMIT` | `200m` / `2000m` |
 | `ORT_WORKER_MEMORY_REQUEST` / `ORT_WORKER_MEMORY_LIMIT` | `4Gi` / `8Gi` |
+| `ORT_WORKER_EPHEMERAL_STORAGE_REQUEST` / `ORT_WORKER_EPHEMERAL_STORAGE_LIMIT` | `10Gi` / `30Gi` |
 
-Alleen de controller krijgt toegang tot de Kubernetes-API en de API-key voor het
-register. Worker-Pods krijgen geen ServiceAccount-token of register-API-key. OAuth-
-gegevens voor resultaatlevering gaan alleen naar workers als `ORT_RESULTS_URL` is
-ingesteld en worden niet doorgegeven aan ORT of package-managers.
-
-In test mag `ORT_RESULTS_URL` leeg blijven. Dan blijven submissions alleen in de
-tijdelijke worker-Pod beschikbaar. Een productie-inrichting vereist daarom eerst
-een resultaatendpoint; de idempotency-key heeft de vorm `ort:<sha256>`.
+Zonder `ORT_RESULTS_URL` logt de leveringsstap alleen de uitkomst; de submission
+verdwijnt met de Pod. Een productie-inrichting vereist daarom eerst een
+resultaatendpoint.
 
 ## Eén repository testen
 

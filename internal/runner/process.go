@@ -8,21 +8,17 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/developer-overheid-nl/ort-runner/internal/register"
 )
 
-var protectedEnvironment = map[string]struct{}{
-	"ORT_REGISTER_API_KEY":    {},
-	"AUTH_TOKEN_URL":          {},
-	"AUTH_CLIENT_ID":          {},
-	"AUTH_CLIENT_SECRET":      {},
-	"AUTH_SCOPES":             {},
-	"KEYCLOAK_BASE_URL":       {},
-	"KEYCLOAK_REALM":          {},
-	"KUBERNETES_SERVICE_HOST": {},
-	"KUBERNETES_SERVICE_PORT": {},
+// Register credentials belong to the HTTP clients, never to scanned code or package managers.
+func protectedEnvironment(name string) bool {
+	return name == register.APIKeyVariable || slices.Contains(register.ResultCredentialVariables, name)
 }
 
 func runCommand(ctx context.Context, name string, args []string, dir string, env []string, logPath string) (int, error) {
@@ -34,9 +30,7 @@ func runCommand(ctx context.Context, name string, args []string, dir string, env
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	for _, entry := range os.Environ() {
-		// Registry credentials belong to the HTTP client, not scanned code or package managers.
-		name := strings.SplitN(entry, "=", 2)[0]
-		if _, protected := protectedEnvironment[name]; protected {
+		if protectedEnvironment(strings.SplitN(entry, "=", 2)[0]) {
 			continue
 		}
 		cmd.Env = append(cmd.Env, entry)

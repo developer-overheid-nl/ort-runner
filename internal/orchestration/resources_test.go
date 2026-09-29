@@ -1,8 +1,11 @@
 package orchestration
 
 import (
+	"maps"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/developer-overheid-nl/ort-runner/internal/register"
 	batchv1 "k8s.io/api/batch/v1"
@@ -37,8 +40,8 @@ func TestBuildConfigMapsCreatesImmutableOwnedSnapshots(t *testing.T) {
 				foundGradle = foundGradle || strings.Contains(value, "org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m")
 			}
 		} else {
-			foundManifest = foundManifest || len(configMap.BinaryData[manifestChunkKey]) > 0
-			if len(configMap.Data) != 0 || len(configMap.BinaryData) != 1 {
+			foundManifest = foundManifest || len(configMap.Data[manifestChunkKey]) > 0
+			if len(configMap.Data) != 1 || len(configMap.BinaryData) != 0 {
 				t.Fatalf("manifest config map contains unexpected data: %+v", configMap)
 			}
 		}
@@ -49,73 +52,83 @@ func TestBuildConfigMapsCreatesImmutableOwnedSnapshots(t *testing.T) {
 }
 
 func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
-	owner := testOwner()
 	resources := testWorkerResources(t)
-	job, err := BuildIndexedJob(owner, "oss", "scan-batch", resources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if *job.Spec.Completions != int32(resources.RepositoryCount) || *job.Spec.Parallelism != 10 || job.Spec.CompletionMode == nil || *job.Spec.CompletionMode != batchv1.IndexedCompletion {
-		t.Fatalf("incorrect indexed job: %+v", job.Spec)
-	}
-	if job.Spec.BackoffLimitPerIndex == nil || *job.Spec.BackoffLimitPerIndex != 1 || job.Spec.MaxFailedIndexes != nil {
-		t.Fatalf("incorrect retry settings: backoff=%v maxFailed=%v", job.Spec.BackoffLimitPerIndex, job.Spec.MaxFailedIndexes)
-	}
-	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 86400 {
-		t.Fatalf("completed worker Pods are not bounded by a TTL: %v", job.Spec.TTLSecondsAfterFinished)
-	}
-	pod := job.Spec.Template.Spec
-	if pod.RestartPolicy != corev1.RestartPolicyNever || pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
-		t.Fatal("worker pod can restart or has an API token")
-	}
-	if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot || pod.SecurityContext.SeccompProfile == nil || pod.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
-		t.Fatalf("pod security context=%+v", pod.SecurityContext)
-	}
-	if pod.SecurityContext.FSGroup == nil || *pod.SecurityContext.FSGroup != 1000 {
-		t.Fatalf("worker output volume is not writable by the ORT image user: fsGroup=%v", pod.SecurityContext.FSGroup)
-	}
-	container := pod.Containers[0]
-	if len(container.Command) != 2 || container.Command[0] != "ort-runner" || container.Command[1] != "worker" {
-		t.Fatalf("command=%v", container.Command)
-	}
-	if container.SecurityContext == nil || container.SecurityContext.AllowPrivilegeEscalation == nil || *container.SecurityContext.AllowPrivilegeEscalation || len(container.SecurityContext.Capabilities.Drop) != 1 || container.SecurityContext.Capabilities.Drop[0] != "ALL" {
-		t.Fatalf("container security context=%+v", container.SecurityContext)
-	}
-	if container.Resources.Requests.Memory().String() != "4Gi" || container.Resources.Limits.Memory().String() != "8Gi" || container.Resources.Requests.Cpu().String() != "200m" || container.Resources.Limits.Cpu().String() != "2" {
-		t.Fatalf("resources=%+v", container.Resources)
-	}
-	environment := map[string]corev1.EnvVar{}
-	for _, variable := range container.Env {
-		environment[variable.Name] = variable
-	}
-	if environment["ORT_OPTS"].Value != "-Xmx4g" || environment["ORT_RESULTS_URL"].Value != "https://example.test/results" || environment["AUTH_CLIENT_SECRET"].ValueFrom == nil {
-		t.Fatalf("worker environment=%+v", environment)
-	}
-	if _, ok := environment["ORT_REGISTER_API_KEY"]; ok {
-		t.Fatal("register API key leaked to worker")
-	}
-	index := environment["JOB_COMPLETION_INDEX"]
-	if index.ValueFrom == nil || index.ValueFrom.FieldRef == nil || index.ValueFrom.FieldRef.FieldPath != "metadata.annotations['batch.kubernetes.io/job-completion-index']" {
-		t.Fatalf("completion index=%+v", index)
-	}
-	for _, mount := range container.VolumeMounts {
-		if (mount.Name == rulesVolumeName || mount.Name == manifestVolumeName) && !mount.ReadOnly {
-			t.Fatalf("snapshot mount is writable: %+v", mount)
-		}
-	}
-}
-
-func TestBuildIndexedJobOmitsResultCredentialsWithoutEndpoint(t *testing.T) {
-	resources := testWorkerResources(t)
-	resources.Environment[0].Value = ""
 	job, err := BuildIndexedJob(testOwner(), "oss", "scan-batch", resources)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, variable := range job.Spec.Template.Spec.Containers[0].Env {
-		if variable.Name == "AUTH_CLIENT_SECRET" || variable.Name == "AUTH_CLIENT_ID" {
-			t.Fatalf("result credential copied without endpoint: %s", variable.Name)
+	spec := job.Spec
+	if *spec.Completions != int32(resources.RepositoryCount) || *spec.Parallelism != 10 || *spec.CompletionMode != batchv1.IndexedCompletion {
+		t.Fatalf("incorrect indexed job: %+v", spec)
+	}
+	if *spec.BackoffLimitPerIndex != 1 || spec.MaxFailedIndexes != nil {
+		t.Fatalf("incorrect retry settings: backoff=%v maxFailed=%v", spec.BackoffLimitPerIndex, spec.MaxFailedIndexes)
+	}
+	if *spec.ActiveDeadlineSeconds != int64(46*time.Hour/time.Second) || *spec.TTLSecondsAfterFinished != 86400 {
+		t.Fatalf("deadline=%v ttl=%v", *spec.ActiveDeadlineSeconds, *spec.TTLSecondsAfterFinished)
+	}
+	pod := spec.Template.Spec
+	if pod.RestartPolicy != corev1.RestartPolicyNever || *pod.AutomountServiceAccountToken || *pod.EnableServiceLinks {
+		t.Fatal("worker Pod can restart, has an API token or receives service links")
+	}
+	if !*pod.SecurityContext.RunAsNonRoot || *pod.SecurityContext.FSGroup != 1000 || pod.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Fatalf("pod security context=%+v", pod.SecurityContext)
+	}
+	if len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
+		t.Fatalf("expected scan init container and delivery container: %d/%d", len(pod.InitContainers), len(pod.Containers))
+	}
+
+	scan := pod.InitContainers[0]
+	if !slices.Equal(scan.Command, []string{"ort-runner", "worker"}) {
+		t.Fatalf("scan command=%v", scan.Command)
+	}
+	limits := scan.Resources.Limits
+	if limits.Memory().String() != "8Gi" || limits.Cpu().String() != "2" || limits.StorageEphemeral().String() != "30Gi" || scan.Resources.Requests.StorageEphemeral().String() != "10Gi" {
+		t.Fatalf("scan resources=%+v", scan.Resources)
+	}
+	scanEnv := environment(scan)
+	if scanEnv["ORT_OPTS"].Value != "-Xmx4g" || scanEnv["ORT_MANIFEST_DIR"].Value != "/manifest" {
+		t.Fatalf("scan environment=%+v", scanEnv)
+	}
+	for _, name := range append([]string{register.APIKeyVariable, register.ResultsURLVariable}, register.ResultCredentialVariables...) {
+		if _, ok := scanEnv[name]; ok {
+			t.Fatalf("scan container receives %s", name)
 		}
+	}
+	for _, mount := range scan.VolumeMounts {
+		if mount.Name != outputVolumeName && !mount.ReadOnly {
+			t.Fatalf("snapshot mount is writable: %+v", mount)
+		}
+	}
+
+	deliver := pod.Containers[0]
+	deliverEnv := environment(deliver)
+	if !slices.Equal(deliver.Command, []string{"ort-runner", "deliver"}) || deliverEnv["ORT_RESULTS_URL"].Value != "https://example.test/results" || deliverEnv["AUTH_CLIENT_SECRET"].ValueFrom == nil {
+		t.Fatalf("delivery container=%+v", deliver)
+	}
+	if _, ok := deliverEnv[register.APIKeyVariable]; ok {
+		t.Fatal("register API key passed to worker")
+	}
+	for _, container := range []corev1.Container{scan, deliver} {
+		if *container.SecurityContext.AllowPrivilegeEscalation || !slices.Equal(container.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+			t.Fatalf("%s security context=%+v", container.Name, container.SecurityContext)
+		}
+	}
+}
+
+func TestResultEnvironmentOmitsCredentialsWithoutEndpoint(t *testing.T) {
+	controller := []corev1.EnvVar{
+		{Name: "ORT_RESULTS_URL", Value: ""},
+		{Name: "AUTH_CLIENT_SECRET", Value: "secret"},
+		{Name: "ORT_REGISTER_API_KEY", Value: "key"},
+	}
+	got := ResultEnvironment(controller)
+	if len(got) != 1 || got[0].Name != "ORT_RESULTS_URL" {
+		t.Fatalf("result environment=%+v", got)
+	}
+	controller[0].Value = "https://example.test/results"
+	if got := ResultEnvironment(controller); len(got) != 2 || got[1].Name != "AUTH_CLIENT_SECRET" {
+		t.Fatalf("result environment=%+v", got)
 	}
 }
 
@@ -133,13 +146,14 @@ func TestBuildResourcesRejectsInvalidConfiguration(t *testing.T) {
 		{name: "owner UID", namespace: "oss", jobName: "job", owner: metav1.OwnerReference{Name: "parent"}},
 		{name: "image", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Image = "" }},
 		{name: "repositories", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.RepositoryCount = 0 }},
-		{name: "parallelism", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Parallelism = 101 }},
-		{name: "retry", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.RetryLimit = 2 }},
+		{name: "parallelism", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.Parallelism = 101 }},
+		{name: "deadline", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.Deadline = 0 }},
 		{name: "rules", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { delete(r.ConfigData, "evaluator.rules.kts") }},
-		{name: "quantity", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.MemoryLimit = "many" }},
+		{name: "quantity", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.MemoryLimit = "many" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resources := valid.deepCopy()
+			resources := valid
+			resources.ConfigData = maps.Clone(valid.ConfigData)
 			if tc.mutate != nil {
 				tc.mutate(&resources)
 			}
@@ -155,12 +169,24 @@ func testOwner() metav1.OwnerReference {
 	return metav1.OwnerReference{APIVersion: "batch/v1", Kind: "Job", Name: "controller-123", UID: types.UID("12345678-1234-1234-1234-123456789abc"), Controller: &controller}
 }
 
+func testSettings() WorkerSettings {
+	return WorkerSettings{
+		Parallelism: 10, Deadline: 46 * time.Hour,
+		CPURequest: "200m", CPULimit: "2000m", MemoryRequest: "4Gi", MemoryLimit: "8Gi",
+		EphemeralStorageRequest: "10Gi", EphemeralStorageLimit: "30Gi",
+	}
+}
+
 func testWorkerResources(t *testing.T) WorkerResources {
 	t.Helper()
-	chunks, err := EncodeManifest(Manifest{SchemaVersion: 1, BatchID: "batch-1", Repositories: []register.Repository{
+	manifest, err := NewManifest("batch-1", []register.Repository{
 		{ID: "a", URL: "https://example.test/a.git"},
 		{ID: "b", URL: "https://example.test/b.git"},
-	}}, 1<<20)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := EncodeManifest(manifest, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,19 +194,22 @@ func testWorkerResources(t *testing.T) WorkerResources {
 		Image:           "ghcr.io/example/ort-runner@sha256:1234",
 		BatchID:         "batch-1",
 		RepositoryCount: 2,
-		Parallelism:     10,
-		RetryLimit:      1,
-		CPURequest:      "200m",
-		CPULimit:        "2000m",
-		MemoryRequest:   "4Gi",
-		MemoryLimit:     "8Gi",
 		ConfigData:      map[string][]byte{"evaluator.rules.kts": []byte("licenseRule {}")},
 		ManifestChunks:  chunks,
-		Environment: []corev1.EnvVar{
+		ResultEnvironment: ResultEnvironment([]corev1.EnvVar{
 			{Name: "ORT_RESULTS_URL", Value: "https://example.test/results"},
 			{Name: "AUTH_CLIENT_ID", Value: "runner"},
 			{Name: "AUTH_CLIENT_SECRET", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "auth"}, Key: "secret"}}},
 			{Name: "ORT_REGISTER_API_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "register"}, Key: "key"}}},
-		},
+		}),
+		Settings: testSettings(),
 	}
+}
+
+func environment(container corev1.Container) map[string]corev1.EnvVar {
+	result := map[string]corev1.EnvVar{}
+	for _, variable := range container.Env {
+		result[variable.Name] = variable
+	}
+	return result
 }

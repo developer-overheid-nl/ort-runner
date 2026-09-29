@@ -40,6 +40,22 @@ func TestWorkerCommandHelpAndRequiredEnvironment(t *testing.T) {
 	}
 }
 
+func TestDeliverCommandRequiresBatchAndSubmission(t *testing.T) {
+	clearWorkerEnv(t)
+	var output bytes.Buffer
+	if code := execute(context.Background(), []string{"deliver", "--help"}, &output, &output); code != 0 {
+		t.Fatalf("help exit=%d", code)
+	}
+	if code := execute(context.Background(), []string{"deliver"}, &output, &output); code != 2 {
+		t.Fatalf("missing batch accepted: exit=%d", code)
+	}
+	t.Setenv("ORT_BATCH_ID", "batch-1")
+	t.Setenv("ORT_OUTPUT_DIR", t.TempDir())
+	if code := execute(context.Background(), []string{"deliver"}, &output, &output); code != 1 {
+		t.Fatalf("missing submission accepted: exit=%d", code)
+	}
+}
+
 func clearWorkerEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{"ORT_BATCH_ID", "ORT_MANIFEST_DIR", "JOB_COMPLETION_INDEX", "ORT_RESULTS_URL", "ORT_CONFIG_DIR", "ORT_OUTPUT_DIR", "ORT_STAGE_TIMEOUT"} {
