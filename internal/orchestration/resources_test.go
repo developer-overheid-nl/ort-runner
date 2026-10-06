@@ -63,7 +63,7 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 	if *spec.Completions != int32(resources.RepositoryCount) || *spec.Parallelism != 10 || *spec.CompletionMode != batchv1.IndexedCompletion {
 		t.Fatalf("incorrect indexed job: %+v", spec)
 	}
-	if *spec.BackoffLimitPerIndex != 1 || spec.MaxFailedIndexes != nil {
+	if *spec.BackoffLimit != 10 || *spec.BackoffLimitPerIndex != 0 || spec.MaxFailedIndexes != nil {
 		t.Fatalf("incorrect retry settings: backoff=%v maxFailed=%v", spec.BackoffLimitPerIndex, spec.MaxFailedIndexes)
 	}
 	if *spec.ActiveDeadlineSeconds != int64(46*time.Hour/time.Second) || *spec.TTLSecondsAfterFinished != 86400 {
@@ -150,6 +150,7 @@ func TestBuildResourcesRejectsInvalidConfiguration(t *testing.T) {
 		{name: "repositories", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.RepositoryCount = 0 }},
 		{name: "parallelism", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.Parallelism = 101 }},
 		{name: "deadline", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.Deadline = 0 }},
+		{name: "round deadline", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.RoundDeadline = 0 }},
 		{name: "repository timeout", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.RepositoryTimeout = 0 }},
 		{name: "rules", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { delete(r.ConfigData, "evaluator.rules.kts") }},
 		{name: "quantity", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.MemoryLimit = "many" }},
@@ -205,7 +206,8 @@ func testWorkerResources(t *testing.T) WorkerResources {
 			{Name: "AUTH_CLIENT_SECRET", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "auth"}, Key: "secret"}}},
 			{Name: "ORT_REGISTER_API_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "register"}, Key: "key"}}},
 		}),
-		Settings: testSettings(),
+		Settings:      testSettings(),
+		RoundDeadline: 46 * time.Hour,
 	}
 }
 
@@ -221,11 +223,11 @@ func TestWorkerJobNameLeavesRoomForPodHostnames(t *testing.T) {
 	// Indexed Job Pods use "<job>-<index>" as hostname, which must be a DNS label.
 	controller := true
 	owner := metav1.OwnerReference{APIVersion: "batch/v1", Kind: "Job", Name: "don-oss-ort-runner-manual-spawn-muwnn2k9-fqbp7", UID: types.UID("12345678-1234-1234-1234-123456789abc"), Controller: &controller}
-	hostname := fmt.Sprintf("%s-%d", workerJobName(owner), math.MaxInt32)
+	hostname := fmt.Sprintf("%s-%d", workerJobName(owner, 0), math.MaxInt32)
 	if len(hostname) > 63 {
 		t.Fatalf("hostname %q has %d characters", hostname, len(hostname))
 	}
-	if workerJobName(owner) == workerJobName(testOwner()) {
+	if workerJobName(owner, 0) == workerJobName(testOwner(), 0) {
 		t.Fatal("worker Job names are not unique per controller")
 	}
 }

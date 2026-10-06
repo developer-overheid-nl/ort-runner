@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -30,8 +31,13 @@ const (
 	scanContainerName    = "scan"
 	deliverContainerName = "deliver"
 
-	// One retry per repository: an OOM or crash may be transient, a second one is not.
-	retriesPerRepository = 1
+	// The tenant admission policy allows a Job backoffLimit of at most 10. It
+	// counts failed Pods across all indexes; when a round reaches it, the
+	// controller continues the unfinished repositories in a new round.
+	jobBackoffLimit = 10
+	// A Pod only fails on OOM, eviction or node loss; a repository is not retried
+	// within a round so that such failures use as little of the budget as possible.
+	retriesPerRepository = 0
 	// ORT gets half of the default 8Gi limit; Gradle, package managers and JVM native memory share the rest.
 	ortJavaOptions   = "-Xmx4g"
 	gradleProperties = "org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m\norg.gradle.daemon=false\n"
@@ -49,6 +55,10 @@ type WorkerResources struct {
 	// ResultEnvironment is passed only to the delivery container; see ResultEnvironment.
 	ResultEnvironment []corev1.EnvVar
 	Settings          WorkerSettings
+	// Round numbers the worker Jobs of one batch; RoundDeadline is the time left
+	// in the batch when the round starts.
+	Round         int
+	RoundDeadline time.Duration
 }
 
 // WorkerSettings are the operator-tunable limits of a batch.
@@ -148,7 +158,7 @@ func BuildConfigMaps(owner metav1.OwnerReference, namespace string, resources Wo
 	for _, chunk := range resources.ManifestChunks {
 		maps = append(maps, &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:            manifestConfigMapName(owner, chunk.Index),
+				Name:            manifestConfigMapName(owner, resources.Round, chunk.Index),
 				Namespace:       namespace,
 				OwnerReferences: []metav1.OwnerReference{owner},
 				Labels:          resourceLabels("manifest", chunk.Digest),
@@ -185,7 +195,7 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 	}
 	manifestSources := make([]corev1.VolumeProjection, 0, len(resources.ManifestChunks))
 	for _, chunk := range resources.ManifestChunks {
-		manifestSources = append(manifestSources, configMapProjection(manifestConfigMapName(owner, chunk.Index),
+		manifestSources = append(manifestSources, configMapProjection(manifestConfigMapName(owner, resources.Round, chunk.Index),
 			corev1.KeyToPath{Key: manifestChunkKey, Path: fmt.Sprintf("chunk-%04d-%s.json", chunk.Index, chunk.Digest)}))
 	}
 
@@ -231,7 +241,7 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 	parallelism := resources.Settings.Parallelism
 	completionMode := batchv1.IndexedCompletion
 	retries := int32(retriesPerRepository)
-	deadline := int64(resources.Settings.Deadline / time.Second)
+	deadline := int64(resources.RoundDeadline / time.Second)
 	ttl := int32(finishedJobTTL)
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, OwnerReferences: []metav1.OwnerReference{owner}, Labels: labels},
@@ -239,18 +249,19 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 			Completions:             &completions,
 			Parallelism:             &parallelism,
 			CompletionMode:          &completionMode,
+			BackoffLimit:            ptr.To(int32(jobBackoffLimit)),
 			BackoffLimitPerIndex:    &retries,
 			ActiveDeadlineSeconds:   &deadline,
 			TTLSecondsAfterFinished: &ttl,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
-					AutomountServiceAccountToken: ptr(false),
-					EnableServiceLinks:           ptr(false),
+					AutomountServiceAccountToken: ptr.To(false),
+					EnableServiceLinks:           ptr.To(false),
 					RestartPolicy:                corev1.RestartPolicyNever,
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot:   ptr(true),
-						FSGroup:        ptr(int64(ortUserGroup)),
+						RunAsNonRoot:   ptr.To(true),
+						FSGroup:        ptr.To(int64(ortUserGroup)),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					InitContainers: []corev1.Container{scan},
@@ -280,6 +291,9 @@ func validateResources(owner metav1.OwnerReference, namespace string, resources 
 	if resources.RepositoryCount <= 0 || len(resources.ManifestChunks) == 0 {
 		return fmt.Errorf("a batch needs at least one repository")
 	}
+	if resources.Round < 0 || resources.RoundDeadline < time.Second {
+		return fmt.Errorf("round must not be negative and needs at least one second until the batch deadline")
+	}
 	if len(resources.ConfigData["evaluator.rules.kts"]) == 0 {
 		return fmt.Errorf("evaluator.rules.kts is required")
 	}
@@ -293,7 +307,7 @@ func validateResources(owner metav1.OwnerReference, namespace string, resources 
 
 func restrictedContainer() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
-		AllowPrivilegeEscalation: ptr(false),
+		AllowPrivilegeEscalation: ptr.To(false),
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
 }
@@ -305,8 +319,6 @@ func configMapProjection(name string, items ...corev1.KeyToPath) corev1.VolumePr
 func projectedVolume(name string, sources ...corev1.VolumeProjection) corev1.Volume {
 	return corev1.Volume{Name: name, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: sources}}}
 }
-
-func ptr[T any](value T) *T { return &value }
 
 type configEntry struct {
 	path string
@@ -339,12 +351,12 @@ func rulesConfigMapName(owner metav1.OwnerReference) string {
 	return resourceName(owner, "rules", dnsLabelLength)
 }
 
-func manifestConfigMapName(owner metav1.OwnerReference, index int) string {
-	return resourceName(owner, fmt.Sprintf("manifest-%04d", index), dnsLabelLength)
+func manifestConfigMapName(owner metav1.OwnerReference, round, index int) string {
+	return resourceName(owner, fmt.Sprintf("r%d-manifest-%04d", round, index), dnsLabelLength)
 }
 
-func workerJobName(owner metav1.OwnerReference) string {
-	return resourceName(owner, "workers", workerJobNameLength)
+func workerJobName(owner metav1.OwnerReference, round int) string {
+	return resourceName(owner, fmt.Sprintf("r%d-workers", round), workerJobNameLength)
 }
 
 // resourceName derives a stable DNS-1123 name of at most maxLength characters

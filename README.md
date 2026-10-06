@@ -156,10 +156,17 @@ repository.
 Een scan heeft een tijdsbudget per repository (`ORT_REPOSITORY_TIMEOUT`, standaard
 `10m`) voor checkout, analyze, advise en evaluate samen. Wordt dat overschreden,
 dan stopt ORT en wordt de repository als mislukt vastgelegd; Kubernetes probeert
-hem dan niet opnieuw. Een mislukte index door bijvoorbeeld een OOM krijgt precies
-één nieuwe Pod; daarna gaan de andere indexen door. Na `ORT_BATCH_DEADLINE` stopt Kubernetes de batch. Alle indexen die niet zijn
-afgerond, ook indexen die nooit zijn gestart, gelden dan als mislukt en worden bij
-een ingesteld resultaatendpoint als mislukt gemeld. Afgeronde worker Jobs en hun
+hem dan niet opnieuw.
+
+Een Pod mislukt alleen bij een OOM-kill, eviction of uitgevallen node. Die
+repository wordt niet opnieuw geprobeerd binnen dezelfde ronde
+(`backoffLimitPerIndex: 0`). Een worker-Job stopt na meer dan 10 mislukte Pods:
+`backoffLimit: 10`, het maximum dat de tenant-policy van het cluster toestaat.
+De controller start dan een nieuwe ronde met alleen de repositories die nog niet
+klaar waren. Dat gebeurt tot alles klaar is, een ronde niets oplevert, er 20
+rondes zijn geweest of `ORT_BATCH_DEADLINE` is verstreken. Repositories die dan
+niet zijn afgerond, gelden als mislukt en worden bij een ingesteld
+resultaatendpoint als mislukt gemeld. Afgeronde worker Jobs en hun
 Pods worden na 24 uur opgeruimd.
 
 ```sh

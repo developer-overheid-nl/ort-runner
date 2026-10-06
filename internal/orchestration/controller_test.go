@@ -61,7 +61,7 @@ func TestRunControllerCreatesAndAdoptsIndexedBatch(t *testing.T) {
 	server := repositoryServer(t, repositories)
 	defer server.Close()
 	client := fake.NewSimpleClientset(controllerPod())
-	completeNextJob(t, client, "0-1", "", batchv1.JobComplete)
+	finishJobs(t, client, jobResult{completed: "0-1"})
 	cfg := controllerConfig(t, server.URL)
 
 	first, err := RunController(context.Background(), client, cfg)
@@ -102,7 +102,7 @@ func TestRunControllerRejectsConflictingResources(t *testing.T) {
 	defer server.Close()
 	cfg := controllerConfig(t, server.URL)
 	base := fake.NewSimpleClientset(controllerPod())
-	completeNextJob(t, base, "0", "", batchv1.JobComplete)
+	finishJobs(t, base, jobResult{completed: "0"})
 	if _, err := RunController(context.Background(), base, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestRunControllerRejectsConflictingResources(t *testing.T) {
 		{name: "image", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { job.Spec.Template.Spec.Containers[0].Image = "other" }},
 		{name: "completions", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.Completions = 2 }},
 		{name: "cleanup TTL", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.TTLSecondsAfterFinished = 60 }},
-		{name: "deadline", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.ActiveDeadlineSeconds = 60 }},
+		{name: "backoff limit", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.BackoffLimit = 6 }},
 		{name: "scan image", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) {
 			job.Spec.Template.Spec.InitContainers[0].Image = "other"
 		}},
@@ -154,7 +154,7 @@ func TestRunControllerReportsTerminalFailedIndex(t *testing.T) {
 	server := repositoryServer(t, repositories)
 	defer server.Close()
 	client := fake.NewSimpleClientset(controllerPod())
-	completeNextJob(t, client, "0", "1", batchv1.JobFailed)
+	finishJobs(t, client, jobResult{completed: "0", failed: "1", reason: batchv1.JobReasonFailedIndexes})
 	reporter := &recordingFailureReporter{}
 	cfg := controllerConfig(t, server.URL)
 	cfg.ResultsURL = "https://example.test/results"
@@ -193,6 +193,7 @@ func TestRunControllerRestartKeepsStoredManifestWhenRegisterChanges(t *testing.T
 	maps, err := BuildConfigMaps(owner, "oss", WorkerResources{
 		Image: "ghcr.io/example/ort-runner@sha256:1234", BatchID: cfg.BatchName, RepositoryCount: 1,
 		ConfigData: map[string][]byte{"evaluator.rules.kts": []byte("licenseRule {}")}, ManifestChunks: chunks, Settings: cfg.Settings,
+		RoundDeadline: cfg.Settings.Deadline,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +209,7 @@ func TestRunControllerRestartKeepsStoredManifestWhenRegisterChanges(t *testing.T
 		w.Header().Set("Total-Pages", "1")
 		fmt.Fprint(w, `[{"id":"a","url":"https://example.test/a.git"},{"id":"b","url":"https://example.test/b.git"}]`)
 	})
-	completeNextJob(t, client, "0", "", batchv1.JobComplete)
+	finishJobs(t, client, jobResult{completed: "0"})
 
 	summary, err := RunController(context.Background(), client, cfg)
 	if err != nil || summary.Total != 1 || summary.Completed != 1 || requests != 0 {
@@ -222,11 +223,86 @@ func TestRunControllerCountsUnfinishedIndexesAsFailed(t *testing.T) {
 	defer server.Close()
 	client := fake.NewSimpleClientset(controllerPod())
 	// Deadline exceeded: index 1 never ran, so it is neither completed nor failed.
-	completeNextJob(t, client, "0", "", batchv1.JobFailed)
+	finishJobs(t, client, jobResult{completed: "0", reason: batchv1.JobReasonDeadlineExceeded})
 
 	summary, err := RunController(context.Background(), client, controllerConfig(t, server.URL))
 	if err != nil || summary.Completed != 1 || summary.Failed != 1 || !slices.Equal(summary.FailedRepositoryIDs, []string{"b"}) {
 		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+}
+
+func TestRunControllerContinuesUnfinishedRepositoriesInNewRound(t *testing.T) {
+	repositories := []register.Repository{
+		{ID: "a", URL: "https://example.test/a.git"}, {ID: "b", URL: "https://example.test/b.git"},
+		{ID: "c", URL: "https://example.test/c.git"}, {ID: "d", URL: "https://example.test/d.git"},
+	}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	// Round 0 hits the backoff limit: a completed, b failed, c and d unfinished.
+	// Round 1 runs only c and d (indexes 0 and 1 of its own manifest).
+	finishJobs(t, client,
+		jobResult{completed: "0", failed: "1", reason: batchv1.JobReasonBackoffLimitExceeded},
+		jobResult{completed: "0-1"},
+	)
+
+	summary, err := RunController(context.Background(), client, controllerConfig(t, server.URL))
+	if err != nil || summary.Total != 4 || summary.Completed != 3 || summary.Failed != 1 || summary.Rounds != 2 || !slices.Equal(summary.FailedRepositoryIDs, []string{"b"}) {
+		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+	jobs, _ := client.BatchV1().Jobs("oss").List(context.Background(), metav1.ListOptions{})
+	for _, job := range jobs.Items {
+		if *job.Spec.BackoffLimit != 10 || *job.Spec.BackoffLimitPerIndex != 0 {
+			t.Fatalf("job %s exceeds the tenant backoff policy: %d/%d", job.Name, *job.Spec.BackoffLimit, *job.Spec.BackoffLimitPerIndex)
+		}
+		if strings.Contains(job.Name, "r1-workers") && *job.Spec.Completions != 2 {
+			t.Fatalf("round 1 runs %d repositories, want 2", *job.Spec.Completions)
+		}
+	}
+}
+
+func TestRunControllerStopsWhenRoundMakesNoProgress(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}, {ID: "b", URL: "https://example.test/b.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	finishJobs(t, client, jobResult{reason: batchv1.JobReasonBackoffLimitExceeded})
+
+	summary, err := RunController(context.Background(), client, controllerConfig(t, server.URL))
+	if err != nil || summary.Rounds != 1 || summary.Failed != 2 {
+		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+}
+
+func TestRunControllerResumesLaterRoundAfterRestart(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}, {ID: "b", URL: "https://example.test/b.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	cfg := controllerConfig(t, server.URL)
+	// First attempt: round 0 hits the limit, then the controller is stopped
+	// while round 1 is running.
+	finishJobs(t, client, jobResult{completed: "0", reason: batchv1.JobReasonBackoffLimitExceeded})
+	ctx, cancel := context.WithCancel(context.Background())
+	client.PrependReactor("create", "jobs", func(action ktesting.Action) (bool, runtime.Object, error) {
+		if strings.Contains(action.(ktesting.CreateAction).GetObject().(*batchv1.Job).Name, "r1-workers") {
+			cancel()
+		}
+		return false, nil, nil
+	})
+	if _, err := RunController(ctx, client, cfg); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first attempt: %v", err)
+	}
+	created := countCreates(client.Actions())
+
+	// The restarted controller adopts both rounds and only waits for round 1.
+	finishJobs(t, client, jobResult{completed: "0", reason: batchv1.JobReasonBackoffLimitExceeded}, jobResult{completed: "0"})
+	summary, err := RunController(context.Background(), client, cfg)
+	if err != nil || summary.Completed != 2 || summary.Failed != 0 || summary.Rounds != 2 {
+		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+	if countCreates(client.Actions()) != created {
+		t.Fatal("restart created new batch resources")
 	}
 }
 
@@ -326,27 +402,48 @@ func repositoryServer(t *testing.T, repositories []register.Repository) *httptes
 	}))
 }
 
-func completeNextJob(t *testing.T, client *fake.Clientset, completed, failed string, condition batchv1.JobConditionType) {
+type jobResult struct {
+	completed, failed string
+	reason            string // empty: the Job completed
+}
+
+// finishJobs gives each new worker Job, in creation order, the next result.
+func finishJobs(t *testing.T, client *fake.Clientset, results ...jobResult) {
 	t.Helper()
 	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
+		finished := map[string]bool{}
+		deadline := time.Now().Add(10 * time.Second)
+		for len(finished) < len(results) && time.Now().Before(deadline) {
 			jobs, _ := client.BatchV1().Jobs("oss").List(context.Background(), metav1.ListOptions{})
-			if len(jobs.Items) == 1 {
-				job := jobs.Items[0].DeepCopy()
-				job.Status.CompletedIndexes = completed
-				if failed != "" {
-					job.Status.FailedIndexes = &failed
+			for _, item := range jobs.Items {
+				if finished[item.Name] {
+					continue
 				}
-				job.Status.Conditions = append(job.Status.Conditions, batchv1.JobCondition{Type: condition, Status: corev1.ConditionTrue})
+				result := results[len(finished)]
+				job := item.DeepCopy()
+				if job.CreationTimestamp.IsZero() {
+					// The fake client does not set it; the API server always does.
+					job.CreationTimestamp = metav1.Now()
+				}
+				job.Status.CompletedIndexes = result.completed
+				if result.failed != "" {
+					job.Status.FailedIndexes = &result.failed
+				}
+				condition := batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}
+				if result.reason != "" {
+					condition = batchv1.JobCondition{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: result.reason}
+				}
+				job.Status.Conditions = append(job.Status.Conditions, condition)
 				if _, err := client.BatchV1().Jobs("oss").UpdateStatus(context.Background(), job, metav1.UpdateOptions{}); err != nil {
-					t.Errorf("complete job: %v", err)
+					t.Errorf("finish job: %v", err)
 				}
-				return
+				finished[item.Name] = true
 			}
 			time.Sleep(time.Millisecond)
 		}
-		t.Error("job was not created")
+		if len(finished) < len(results) {
+			t.Errorf("only %d of %d worker Jobs were created", len(finished), len(results))
+		}
 	}()
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -22,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 )
 
 // ConfigMaps are limited to 1 MiB; the margin leaves room for metadata.
@@ -46,6 +48,7 @@ type BatchSummary struct {
 	Completed           int      `json:"completed"`
 	Failed              int      `json:"failed"`
 	FailedRepositoryIDs []string `json:"failedRepositoryIds"`
+	Rounds              int      `json:"rounds"`
 }
 
 // FailureReporter records repositories whose worker never delivered a result.
@@ -53,8 +56,13 @@ type FailureReporter interface {
 	ReportFailedIndex(context.Context, string, register.Repository) error
 }
 
-// RunController creates or adopts the Indexed Job of this batch and waits until
-// every repository has completed or failed.
+// A round stops early when it reaches jobBackoffLimit; every new round runs only
+// the repositories that did not finish, so the number of rounds stays small.
+const maxRounds = 20
+
+// RunController runs the batch in one or more Indexed Job rounds and waits until
+// every repository has completed or failed. A restarted controller resumes the
+// rounds that an earlier attempt of the same controller Job created.
 func RunController(ctx context.Context, client kubernetes.Interface, cfg ControllerConfig) (BatchSummary, error) {
 	if client == nil {
 		return BatchSummary{}, fmt.Errorf("Kubernetes client is required")
@@ -76,57 +84,80 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 	if err != nil {
 		return BatchSummary{}, err
 	}
+	b := batch{client: client, cfg: cfg, owner: owner}
 
-	manifest, chunks, err := batchManifest(ctx, client, cfg, owner)
+	manifest, chunks, err := b.roundManifest(ctx, 0, func() ([]register.Repository, error) {
+		return cfg.RegisterClient.RepositorySets(ctx, cfg.RepositoriesURL)
+	})
 	if err != nil {
 		return BatchSummary{}, err
 	}
-	if len(manifest.Repositories) == 0 {
-		return BatchSummary{BatchID: cfg.BatchName, FailedRepositoryIDs: []string{}}, nil
+	summary := BatchSummary{BatchID: cfg.BatchName, Total: len(manifest.Repositories), FailedRepositoryIDs: []string{}}
+	if summary.Total == 0 {
+		return summary, nil
 	}
 	configData, err := readConfigData(cfg.ConfigDir)
 	if err != nil {
 		return BatchSummary{}, err
 	}
-	resources := WorkerResources{
+	template := WorkerResources{
 		Image:             image,
 		BatchID:           cfg.BatchName,
-		RepositoryCount:   len(manifest.Repositories),
 		ConfigData:        configData,
-		ManifestChunks:    chunks,
 		ResultEnvironment: ResultEnvironment(environment),
 		Settings:          cfg.Settings,
 	}
-	configMaps, err := BuildConfigMaps(owner, cfg.Namespace, resources)
-	if err != nil {
-		return BatchSummary{}, err
-	}
-	// Chunk 0 is created last: its presence proves all other chunks exist, which
-	// batchManifest relies on after a controller restart.
-	slices.Reverse(configMaps[1:])
-	for _, desired := range configMaps {
-		if err := createOrVerifyConfigMap(ctx, client, desired); err != nil {
-			return BatchSummary{}, err
+
+	var failed []register.Repository
+	var batchEnd time.Time
+	for round := 0; ; round++ {
+		if round > 0 {
+			manifest, chunks, err = b.roundManifest(ctx, round, func() ([]register.Repository, error) {
+				return manifest.Repositories, nil
+			})
+			if err != nil {
+				return summary, err
+			}
 		}
-	}
-	desiredJob, err := BuildIndexedJob(owner, cfg.Namespace, workerJobName(owner), resources)
-	if err != nil {
-		return BatchSummary{}, err
-	}
-	if err := createOrVerifyJob(ctx, client, desiredJob); err != nil {
-		return BatchSummary{}, err
+		resources := template
+		resources.Round = round
+		resources.RepositoryCount = len(manifest.Repositories)
+		resources.ManifestChunks = chunks
+		resources.RoundDeadline = cfg.Settings.Deadline
+		if round > 0 {
+			// At least one second: a restarted controller may adopt a round after
+			// the batch deadline; a new Job then stops immediately.
+			resources.RoundDeadline = max(time.Until(batchEnd).Truncate(time.Second), time.Second)
+		}
+		job, err := b.runRound(ctx, resources)
+		if err != nil {
+			return summary, err
+		}
+		if round == 0 {
+			batchEnd = job.CreationTimestamp.Add(cfg.Settings.Deadline)
+		}
+		outcome, err := roundOutcome(job, manifest)
+		if err != nil {
+			return summary, err
+		}
+		summary.Rounds = round + 1
+		summary.Completed += outcome.completed
+		failed = append(failed, outcome.failed...)
+		slog.Info("ORT round finished", "batch_id", cfg.BatchName, "round", round, "completed", outcome.completed,
+			"failed", len(outcome.failed), "unfinished", len(outcome.unfinished), "reason", outcome.reason)
+
+		progressed := outcome.completed > 0 || len(outcome.failed) > 0
+		retry := outcome.reason == batchv1.JobReasonBackoffLimitExceeded && progressed &&
+			round+1 < maxRounds && time.Until(batchEnd) >= time.Minute
+		if len(outcome.unfinished) == 0 || !retry {
+			failed = append(failed, outcome.unfinished...)
+			break
+		}
+		manifest = Manifest{Repositories: outcome.unfinished}
 	}
 
-	terminal, err := waitForTerminalJob(ctx, client, cfg.Namespace, desiredJob.Name)
-	if err != nil {
-		return BatchSummary{}, err
-	}
-	summary, failedIndexes, err := summarizeJob(terminal, len(manifest.Repositories), cfg.BatchName)
-	if err != nil {
-		return BatchSummary{}, err
-	}
-	for _, index := range failedIndexes {
-		repository := manifest.Repositories[index]
+	summary.Failed = len(failed)
+	for _, repository := range failed {
 		summary.FailedRepositoryIDs = append(summary.FailedRepositoryIDs, repository.ID)
 		if cfg.ResultsURL == "" {
 			continue
@@ -139,30 +170,61 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 	return summary, nil
 }
 
-// batchManifest reuses the repository list stored by an earlier attempt of this
-// controller Job. Only a first attempt reads the register, so a register change
-// during the batch cannot conflict with resources that already exist.
-func batchManifest(ctx context.Context, client kubernetes.Interface, cfg ControllerConfig, owner metav1.OwnerReference) (Manifest, []Chunk, error) {
-	stored, err := storedManifestChunks(ctx, client, cfg.Namespace, owner)
+type batch struct {
+	client kubernetes.Interface
+	cfg    ControllerConfig
+	owner  metav1.OwnerReference
+}
+
+// runRound creates or adopts the ConfigMaps and worker Job of one round and
+// waits until that Job finishes.
+func (b batch) runRound(ctx context.Context, resources WorkerResources) (*batchv1.Job, error) {
+	configMaps, err := BuildConfigMaps(b.owner, b.cfg.Namespace, resources)
+	if err != nil {
+		return nil, err
+	}
+	// Chunk 0 is created last: its presence proves all other chunks exist, which
+	// roundManifest relies on after a controller restart.
+	slices.Reverse(configMaps[1:])
+	for _, desired := range configMaps {
+		if err := createOrVerifyConfigMap(ctx, b.client, desired); err != nil {
+			return nil, err
+		}
+	}
+	desired, err := BuildIndexedJob(b.owner, b.cfg.Namespace, workerJobName(b.owner, resources.Round), resources)
+	if err != nil {
+		return nil, err
+	}
+	if err := createOrVerifyJob(ctx, b.client, desired); err != nil {
+		return nil, err
+	}
+	return waitForTerminalJob(ctx, b.client, b.cfg.Namespace, desired.Name)
+}
+
+// roundManifest reuses the repository list an earlier controller attempt stored
+// for this round, so a register change or restart cannot alter a running batch.
+// Only when nothing is stored yet does it call repositories.
+func (b batch) roundManifest(ctx context.Context, round int, repositories func() ([]register.Repository, error)) (Manifest, []Chunk, error) {
+	stored, err := storedManifestChunks(ctx, b.client, b.cfg.Namespace, b.owner, round)
 	if err != nil {
 		return Manifest{}, nil, err
 	}
 	if stored != nil {
 		manifest, err := DecodeManifest(stored)
 		if err != nil {
-			return Manifest{}, nil, fmt.Errorf("stored repository manifest: %w", err)
+			return Manifest{}, nil, fmt.Errorf("stored manifest of round %d: %w", round, err)
 		}
-		if manifest.BatchID != cfg.BatchName {
+		if manifest.BatchID != b.cfg.BatchName {
 			return Manifest{}, nil, fmt.Errorf("stored manifest belongs to batch %q", manifest.BatchID)
 		}
 		return manifest, stored, nil
 	}
 
-	repositories, err := cfg.RegisterClient.RepositorySets(ctx, cfg.RepositoriesURL)
+	list, err := repositories()
 	if err != nil {
 		return Manifest{}, nil, fmt.Errorf("read repositories: %w", err)
 	}
-	manifest, err := NewManifest(cfg.BatchName, repositories)
+	manifest, err := NewManifest(b.cfg.BatchName, list)
 	if err != nil {
 		return Manifest{}, nil, err
 	}
@@ -173,8 +235,8 @@ func batchManifest(ctx context.Context, client kubernetes.Interface, cfg Control
 	return manifest, chunks, nil
 }
 
-func storedManifestChunks(ctx context.Context, client kubernetes.Interface, namespace string, owner metav1.OwnerReference) ([]Chunk, error) {
-	first, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, manifestConfigMapName(owner, 0), metav1.GetOptions{})
+func storedManifestChunks(ctx context.Context, client kubernetes.Interface, namespace string, owner metav1.OwnerReference, round int) ([]Chunk, error) {
+	first, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, manifestConfigMapName(owner, round, 0), metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil, nil
 	}
@@ -189,7 +251,7 @@ func storedManifestChunks(ctx context.Context, client kubernetes.Interface, name
 	for index := range count {
 		configMap := first
 		if index > 0 {
-			configMap, err = client.CoreV1().ConfigMaps(namespace).Get(ctx, manifestConfigMapName(owner, index), metav1.GetOptions{})
+			configMap, err = client.CoreV1().ConfigMaps(namespace).Get(ctx, manifestConfigMapName(owner, round, index), metav1.GetOptions{})
 			if err != nil {
 				return nil, fmt.Errorf("read stored manifest chunk %d: %w", index, err)
 			}
@@ -326,7 +388,8 @@ func createOrVerifyJob(ctx context.Context, client kubernetes.Interface, desired
 }
 
 // sameJobSpec compares the fields this package sets; fields defaulted by the
-// API server are ignored.
+// API server are ignored. ActiveDeadlineSeconds is left out: later rounds get
+// the time left in the batch, which depends on when the Job was created.
 func sameJobSpec(existing, desired batchv1.JobSpec) bool {
 	a, b := existing.Template.Spec, desired.Template.Spec
 	return reflect.DeepEqual(existing.Completions, desired.Completions) &&
@@ -334,7 +397,7 @@ func sameJobSpec(existing, desired batchv1.JobSpec) bool {
 		reflect.DeepEqual(existing.CompletionMode, desired.CompletionMode) &&
 		reflect.DeepEqual(existing.BackoffLimitPerIndex, desired.BackoffLimitPerIndex) &&
 		reflect.DeepEqual(existing.MaxFailedIndexes, desired.MaxFailedIndexes) &&
-		reflect.DeepEqual(existing.ActiveDeadlineSeconds, desired.ActiveDeadlineSeconds) &&
+		reflect.DeepEqual(existing.BackoffLimit, desired.BackoffLimit) &&
 		reflect.DeepEqual(existing.TTLSecondsAfterFinished, desired.TTLSecondsAfterFinished) &&
 		containsLabels(existing.Template.Labels, desired.Template.Labels) &&
 		a.RestartPolicy == b.RestartPolicy &&
@@ -432,22 +495,47 @@ func jobTerminal(job *batchv1.Job) bool {
 	})
 }
 
-// summarizeJob treats every index that did not complete as failed. That
-// includes indexes that never ran because the batch deadline expired.
-func summarizeJob(job *batchv1.Job, total int, batchID string) (BatchSummary, []int, error) {
+type outcome struct {
+	completed  int
+	failed     []register.Repository
+	unfinished []register.Repository
+	reason     string
+}
+
+// roundOutcome splits the repositories of a finished round into completed,
+// failed (their Pod failed) and unfinished (never ran, or stopped because the
+// round ended early).
+func roundOutcome(job *batchv1.Job, manifest Manifest) (outcome, error) {
+	total := len(manifest.Repositories)
 	completed, err := ParseIndexes(job.Status.CompletedIndexes, total)
 	if err != nil {
-		return BatchSummary{}, nil, fmt.Errorf("parse completed indexes: %w", err)
+		return outcome{}, fmt.Errorf("parse completed indexes: %w", err)
 	}
-	done := make([]bool, total)
+	failed, err := ParseIndexes(ptr.Deref(job.Status.FailedIndexes, ""), total)
+	if err != nil {
+		return outcome{}, fmt.Errorf("parse failed indexes: %w", err)
+	}
+	state := make([]byte, total)
 	for _, index := range completed {
-		done[index] = true
+		state[index] = 'c'
 	}
-	failed := make([]int, 0, total-len(completed))
-	for index, ok := range done {
-		if !ok {
-			failed = append(failed, index)
+	result := outcome{completed: len(completed)}
+	for _, index := range failed {
+		if state[index] == 'c' {
+			return outcome{}, fmt.Errorf("index %d is both completed and failed", index)
+		}
+		state[index] = 'f'
+		result.failed = append(result.failed, manifest.Repositories[index])
+	}
+	for index, value := range state {
+		if value == 0 {
+			result.unfinished = append(result.unfinished, manifest.Repositories[index])
 		}
 	}
-	return BatchSummary{BatchID: batchID, Total: total, Completed: len(completed), Failed: len(failed), FailedRepositoryIDs: []string{}}, failed, nil
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			result.reason = condition.Reason
+		}
+	}
+	return result, nil
 }
