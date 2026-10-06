@@ -1,7 +1,9 @@
 package orchestration
 
 import (
+	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -213,4 +215,17 @@ func environment(container corev1.Container) map[string]corev1.EnvVar {
 		result[variable.Name] = variable
 	}
 	return result
+}
+
+func TestWorkerJobNameLeavesRoomForPodHostnames(t *testing.T) {
+	// Indexed Job Pods use "<job>-<index>" as hostname, which must be a DNS label.
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: "batch/v1", Kind: "Job", Name: "don-oss-ort-runner-manual-spawn-muwnn2k9-fqbp7", UID: types.UID("12345678-1234-1234-1234-123456789abc"), Controller: &controller}
+	hostname := fmt.Sprintf("%s-%d", workerJobName(owner), math.MaxInt32)
+	if len(hostname) > 63 {
+		t.Fatalf("hostname %q has %d characters", hostname, len(hostname))
+	}
+	if workerJobName(owner) == workerJobName(testOwner()) {
+		t.Fatal("worker Job names are not unique per controller")
+	}
 }

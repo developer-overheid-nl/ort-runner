@@ -328,17 +328,28 @@ func sortedConfigEntries(data map[string][]byte) []configEntry {
 
 func configMapKey(index int) string { return fmt.Sprintf("file-%04d", index) }
 
-func rulesConfigMapName(owner metav1.OwnerReference) string { return resourceName(owner, "rules") }
+const (
+	dnsLabelLength = 63
+	hashLength     = 10
+	// Indexed Job Pods use "<job>-<index>" as hostname; an int32 index has at most 10 digits.
+	workerJobNameLength = dnsLabelLength - len("-") - 10
+)
 
-func manifestConfigMapName(owner metav1.OwnerReference, index int) string {
-	return resourceName(owner, fmt.Sprintf("manifest-%04d", index))
+func rulesConfigMapName(owner metav1.OwnerReference) string {
+	return resourceName(owner, "rules", dnsLabelLength)
 }
 
-func workerJobName(owner metav1.OwnerReference) string { return resourceName(owner, "workers") }
+func manifestConfigMapName(owner metav1.OwnerReference, index int) string {
+	return resourceName(owner, fmt.Sprintf("manifest-%04d", index), dnsLabelLength)
+}
 
-// resourceName derives a stable DNS-1123 name from the controller Job, so a
-// restarted controller finds the resources of its own batch.
-func resourceName(owner metav1.OwnerReference, purpose string) string {
+func workerJobName(owner metav1.OwnerReference) string {
+	return resourceName(owner, "workers", workerJobNameLength)
+}
+
+// resourceName derives a stable DNS-1123 name of at most maxLength characters
+// from the controller Job, so a restarted controller finds its own resources.
+func resourceName(owner metav1.OwnerReference, purpose string, maxLength int) string {
 	sum := sha256.Sum256([]byte(string(owner.UID) + "\x00" + purpose))
 	prefix := strings.Map(func(r rune) rune {
 		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
@@ -347,10 +358,10 @@ func resourceName(owner metav1.OwnerReference, purpose string) string {
 		return '-'
 	}, strings.ToLower(owner.Name+"-"+purpose))
 	prefix = strings.Trim(prefix, "-")
-	if len(prefix) > 52 {
-		prefix = strings.Trim(prefix[:52], "-")
+	if limit := maxLength - len("-") - hashLength; len(prefix) > limit {
+		prefix = strings.Trim(prefix[:limit], "-")
 	}
-	return prefix + "-" + hex.EncodeToString(sum[:])[:10]
+	return prefix + "-" + hex.EncodeToString(sum[:])[:hashLength]
 }
 
 func resourceLabels(purpose, digest string) map[string]string {
