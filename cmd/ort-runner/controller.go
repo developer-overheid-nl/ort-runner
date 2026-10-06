@@ -36,6 +36,7 @@ Configured through the environment:
   ORT_CONFIG_DIR                   directory with evaluator.rules.kts
   ORT_PARALLELISM                  concurrent workers, 1-100 (default 10)
   ORT_BATCH_DEADLINE               maximum batch duration (default 46h)
+  ORT_REPOSITORY_TIMEOUT           time budget per repository scan (default 10m)
   ORT_WORKER_CPU_REQUEST/LIMIT     (default 200m / 2000m)
   ORT_WORKER_MEMORY_REQUEST/LIMIT  (default 4Gi / 8Gi)
   ORT_WORKER_EPHEMERAL_STORAGE_REQUEST/LIMIT  (default 10Gi / 30Gi)
@@ -60,6 +61,11 @@ func executeController(ctx context.Context, args []string, stdout, stderr io.Wri
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	repositoryTimeout, err := envDuration("ORT_REPOSITORY_TIMEOUT", 10*time.Minute)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	httpTimeout, err := envDuration("ORT_HTTP_TIMEOUT", 30*time.Second)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -76,6 +82,7 @@ func executeController(ctx context.Context, args []string, stdout, stderr io.Wri
 		Settings: orchestration.WorkerSettings{
 			Parallelism:             int32(parallelism),
 			Deadline:                deadline,
+			RepositoryTimeout:       repositoryTimeout,
 			CPURequest:              envDefault("ORT_WORKER_CPU_REQUEST", "200m"),
 			CPULimit:                envDefault("ORT_WORKER_CPU_LIMIT", "2000m"),
 			MemoryRequest:           envDefault("ORT_WORKER_MEMORY_REQUEST", "4Gi"),

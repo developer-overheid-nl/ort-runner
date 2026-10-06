@@ -58,7 +58,7 @@ func TestDeliverCommandRequiresBatchAndSubmission(t *testing.T) {
 
 func clearWorkerEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"ORT_BATCH_ID", "ORT_MANIFEST_DIR", "JOB_COMPLETION_INDEX", "ORT_RESULTS_URL", "ORT_CONFIG_DIR", "ORT_OUTPUT_DIR", "ORT_STAGE_TIMEOUT"} {
+	for _, name := range []string{"ORT_BATCH_ID", "ORT_MANIFEST_DIR", "JOB_COMPLETION_INDEX", "ORT_RESULTS_URL", "ORT_CONFIG_DIR", "ORT_OUTPUT_DIR", "ORT_REPOSITORY_TIMEOUT"} {
 		t.Setenv(name, "")
 	}
 	clearAuthEnv(t)

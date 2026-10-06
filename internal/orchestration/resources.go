@@ -55,6 +55,7 @@ type WorkerResources struct {
 type WorkerSettings struct {
 	Parallelism             int32
 	Deadline                time.Duration
+	RepositoryTimeout       time.Duration
 	CPURequest              string
 	CPULimit                string
 	MemoryRequest           string
@@ -76,8 +77,8 @@ func (settings WorkerSettings) quantities() (workerQuantities, error) {
 	if settings.Parallelism < 1 || settings.Parallelism > 100 {
 		return workerQuantities{}, fmt.Errorf("parallelism must be between 1 and 100")
 	}
-	if settings.Deadline <= 0 {
-		return workerQuantities{}, fmt.Errorf("batch deadline must be positive")
+	if settings.Deadline <= 0 || settings.RepositoryTimeout <= 0 {
+		return workerQuantities{}, fmt.Errorf("batch deadline and repository timeout must be positive")
 	}
 	parse := func(name, value string) (resource.Quantity, error) {
 		quantity, err := resource.ParseQuantity(value)
@@ -197,6 +198,7 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 			corev1.EnvVar{Name: "ORT_MANIFEST_DIR", Value: "/manifest"},
 			corev1.EnvVar{Name: "ORT_CONFIG_DIR", Value: "/config"},
 			corev1.EnvVar{Name: "ORT_OPTS", Value: ortJavaOptions},
+			corev1.EnvVar{Name: "ORT_REPOSITORY_TIMEOUT", Value: resources.Settings.RepositoryTimeout.String()},
 		),
 		Resources:       corev1.ResourceRequirements{Requests: quantities.requests, Limits: quantities.limits},
 		SecurityContext: restrictedContainer(),

@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -33,7 +34,10 @@ type ScanConfig struct {
 	BatchID         string
 	CompletionIndex int
 	ManifestDir     string
-	Runner          runner.Config
+	// Timeout bounds the whole repository scan. A repository that exceeds it is
+	// recorded as failed instead of being retried by Kubernetes.
+	Timeout time.Duration
+	Runner  runner.Config
 
 	scan func(context.Context, runner.Config) (runner.Report, error)
 }
@@ -55,8 +59,8 @@ func ResultIdempotencyKey(batchID, repositoryID string) string {
 // Scan scans the repository at the completion index and writes its submission.
 // A failed scan is a result, not an error; errors mean the worker itself failed.
 func Scan(ctx context.Context, cfg ScanConfig) (runner.Submission, error) {
-	if cfg.BatchID == "" || cfg.ManifestDir == "" || cfg.Runner.OutputDir == "" {
-		return runner.Submission{}, fmt.Errorf("batch ID, manifest directory and output directory are required")
+	if cfg.BatchID == "" || cfg.ManifestDir == "" || cfg.Runner.OutputDir == "" || cfg.Timeout <= 0 {
+		return runner.Submission{}, fmt.Errorf("batch ID, manifest directory, output directory and positive timeout are required")
 	}
 	manifest, err := readManifest(cfg.ManifestDir)
 	if err != nil {
@@ -79,7 +83,16 @@ func Scan(ctx context.Context, cfg ScanConfig) (runner.Submission, error) {
 	}
 	scanConfig := cfg.Runner
 	scanConfig.Repository = repository.URL
-	report, scanErr := scan(ctx, scanConfig)
+	scanCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	report, scanErr := scan(scanCtx, scanConfig)
+	cancel()
+	if ctx.Err() != nil {
+		return runner.Submission{}, fmt.Errorf("scan interrupted: %w", ctx.Err())
+	}
+	if errors.Is(scanCtx.Err(), context.DeadlineExceeded) {
+		report.Status = "failed"
+		report.Error = fmt.Sprintf("repository scan exceeded the %s time budget", cfg.Timeout)
+	}
 	if report.Status == "" {
 		report.Status = "failed"
 	}

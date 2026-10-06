@@ -87,7 +87,7 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 		t.Fatalf("scan resources=%+v", scan.Resources)
 	}
 	scanEnv := environment(scan)
-	if scanEnv["ORT_OPTS"].Value != "-Xmx4g" || scanEnv["ORT_MANIFEST_DIR"].Value != "/manifest" {
+	if scanEnv["ORT_OPTS"].Value != "-Xmx4g" || scanEnv["ORT_MANIFEST_DIR"].Value != "/manifest" || scanEnv["ORT_REPOSITORY_TIMEOUT"].Value != "10m0s" {
 		t.Fatalf("scan environment=%+v", scanEnv)
 	}
 	for _, name := range append([]string{register.APIKeyVariable, register.ResultsURLVariable}, register.ResultCredentialVariables...) {
@@ -148,6 +148,7 @@ func TestBuildResourcesRejectsInvalidConfiguration(t *testing.T) {
 		{name: "repositories", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.RepositoryCount = 0 }},
 		{name: "parallelism", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.Parallelism = 101 }},
 		{name: "deadline", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.Deadline = 0 }},
+		{name: "repository timeout", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.RepositoryTimeout = 0 }},
 		{name: "rules", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { delete(r.ConfigData, "evaluator.rules.kts") }},
 		{name: "quantity", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.MemoryLimit = "many" }},
 	} {
@@ -171,7 +172,7 @@ func testOwner() metav1.OwnerReference {
 
 func testSettings() WorkerSettings {
 	return WorkerSettings{
-		Parallelism: 10, Deadline: 46 * time.Hour,
+		Parallelism: 10, Deadline: 46 * time.Hour, RepositoryTimeout: 10 * time.Minute,
 		CPURequest: "200m", CPULimit: "2000m", MemoryRequest: "4Gi", MemoryLimit: "8Gi",
 		EphemeralStorageRequest: "10Gi", EphemeralStorageLimit: "30Gi",
 	}

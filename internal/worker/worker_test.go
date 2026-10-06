@@ -56,6 +56,34 @@ func TestScanTreatsRepositoryFailureAsResult(t *testing.T) {
 	}
 }
 
+func TestScanRecordsTimeoutAsFailedResult(t *testing.T) {
+	cfg := scanConfig(t)
+	cfg.Timeout = 10 * time.Millisecond
+	cfg.scan = func(ctx context.Context, scan runner.Config) (runner.Report, error) {
+		<-ctx.Done()
+		return runner.Report{Status: "failed", Repository: scan.Repository}, ctx.Err()
+	}
+	if _, err := Scan(context.Background(), cfg); err != nil {
+		t.Fatalf("timeout failed the worker, Kubernetes would retry it: %v", err)
+	}
+	submission := readSubmission(t, cfg.Runner.OutputDir)
+	if submission.Scan.Status != "failed" || submission.Scan.Error != "repository scan exceeded the 10ms time budget" {
+		t.Fatalf("submission=%+v", submission.Scan)
+	}
+}
+
+func TestScanFailsWorkerWhenInterrupted(t *testing.T) {
+	cfg := scanConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cfg.scan = func(context.Context, runner.Config) (runner.Report, error) {
+		cancel()
+		return runner.Report{Status: "failed"}, context.Canceled
+	}
+	if _, err := Scan(ctx, cfg); err == nil {
+		t.Fatal("interrupted scan reported as repository result")
+	}
+}
+
 func TestScanRejectsInvalidManifestSelection(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -168,7 +196,7 @@ func scanConfig(t *testing.T) ScanConfig {
 		}
 	}
 	return ScanConfig{
-		BatchID: "batch-1", ManifestDir: manifestDir,
+		BatchID: "batch-1", ManifestDir: manifestDir, Timeout: time.Minute,
 		Runner: runner.Config{OutputDir: t.TempDir(), ConfigDir: t.TempDir(), StageTimeout: time.Minute},
 	}
 }

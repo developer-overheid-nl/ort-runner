@@ -20,7 +20,7 @@ credentials. Configured through the environment:
 
   ORT_BATCH_ID, ORT_MANIFEST_DIR, JOB_COMPLETION_INDEX
   ORT_CONFIG_DIR (default /config), ORT_OUTPUT_DIR (default /output)
-  ORT_STAGE_TIMEOUT (default 30m)
+  ORT_REPOSITORY_TIMEOUT (default 10m): time budget for the whole scan
 `
 
 const deliverUsage = `Usage: ort-runner deliver
@@ -34,7 +34,7 @@ func executeWorker(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if code, done := internalCommandArgs(args, workerUsage, stdout, stderr); done {
 		return code
 	}
-	stageTimeout, err := envDuration("ORT_STAGE_TIMEOUT", 30*time.Minute)
+	timeout, err := envDuration("ORT_REPOSITORY_TIMEOUT", 10*time.Minute)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -48,12 +48,14 @@ func executeWorker(ctx context.Context, args []string, stdout, stderr io.Writer)
 		BatchID:         os.Getenv("ORT_BATCH_ID"),
 		CompletionIndex: index,
 		ManifestDir:     os.Getenv("ORT_MANIFEST_DIR"),
+		Timeout:         timeout,
 		Runner: runner.Config{
 			ConfigDir:     envDefault("ORT_CONFIG_DIR", "/config"),
 			OutputDir:     envDefault("ORT_OUTPUT_DIR", "/output"),
 			ORTImage:      os.Getenv("ORT_RUNNER_ORT_IMAGE"),
 			RunnerVersion: version,
-			StageTimeout:  stageTimeout,
+			// No single stage can outlast the repository budget.
+			StageTimeout: timeout,
 		},
 	}
 	if cfg.BatchID == "" || cfg.ManifestDir == "" {

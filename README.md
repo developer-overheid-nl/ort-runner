@@ -153,8 +153,11 @@ en `512Mi` metaspace, ook als een gescande repository hogere waarden bevat. Een
 Pod die zijn geheugen- of opslaglimiet overschrijdt, raakt alleen zijn eigen
 repository.
 
-Een mislukte index krijgt precies één nieuwe Pod; daarna gaan de andere indexen
-door. Na `ORT_BATCH_DEADLINE` stopt Kubernetes de batch. Alle indexen die niet zijn
+Een scan heeft een tijdsbudget per repository (`ORT_REPOSITORY_TIMEOUT`, standaard
+`10m`) voor checkout, analyze, advise en evaluate samen. Wordt dat overschreden,
+dan stopt ORT en wordt de repository als mislukt vastgelegd; Kubernetes probeert
+hem dan niet opnieuw. Een mislukte index door bijvoorbeeld een OOM krijgt precies
+één nieuwe Pod; daarna gaan de andere indexen door. Na `ORT_BATCH_DEADLINE` stopt Kubernetes de batch. Alle indexen die niet zijn
 afgerond, ook indexen die nooit zijn gestart, gelden dan als mislukt en worden bij
 een ingesteld resultaatendpoint als mislukt gemeld. Afgeronde worker Jobs en hun
 Pods worden na 24 uur opgeruimd.
@@ -170,6 +173,7 @@ De belangrijkste controllerwaarden zijn:
 | --- | --- |
 | `ORT_PARALLELISM` | `10` |
 | `ORT_BATCH_DEADLINE` | `46h` |
+| `ORT_REPOSITORY_TIMEOUT` | `10m` |
 | `ORT_WORKER_CPU_REQUEST` / `ORT_WORKER_CPU_LIMIT` | `200m` / `2000m` |
 | `ORT_WORKER_MEMORY_REQUEST` / `ORT_WORKER_MEMORY_LIMIT` | `4Gi` / `8Gi` |
 | `ORT_WORKER_EPHEMERAL_STORAGE_REQUEST` / `ORT_WORKER_EPHEMERAL_STORAGE_LIMIT` | `10Gi` / `30Gi` |
