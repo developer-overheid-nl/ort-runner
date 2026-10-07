@@ -42,7 +42,9 @@ const (
 	ortJavaOptions   = "-Xmx4g"
 	gradleProperties = "org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m\norg.gradle.daemon=false\n"
 	finishedJobTTL   = 24 * 60 * 60
-	ortUserGroup     = 1000
+	// uid and gid of the "ort" user in the ORT image. runAsNonRoot can only be
+	// verified with a numeric user, and the image declares the user by name.
+	ortUser = 1000
 )
 
 // WorkerResources describes one batch of repository workers.
@@ -261,7 +263,9 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 					RestartPolicy:                corev1.RestartPolicyNever,
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
-						FSGroup:        ptr.To(int64(ortUserGroup)),
+						RunAsUser:      ptr.To(int64(ortUser)),
+						RunAsGroup:     ptr.To(int64(ortUser)),
+						FSGroup:        ptr.To(int64(ortUser)),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					InitContainers: []corev1.Container{scan},

@@ -73,7 +73,10 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 	if pod.RestartPolicy != corev1.RestartPolicyNever || *pod.AutomountServiceAccountToken || *pod.EnableServiceLinks {
 		t.Fatal("worker Pod can restart, has an API token or receives service links")
 	}
-	if !*pod.SecurityContext.RunAsNonRoot || *pod.SecurityContext.FSGroup != 1000 || pod.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+	// The ORT image names its user ("ort"); runAsNonRoot needs a numeric user to verify.
+	security := pod.SecurityContext
+	if !*security.RunAsNonRoot || security.RunAsUser == nil || *security.RunAsUser != 1000 || security.RunAsGroup == nil || *security.RunAsGroup != 1000 ||
+		*security.FSGroup != 1000 || security.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatalf("pod security context=%+v", pod.SecurityContext)
 	}
 	if len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
