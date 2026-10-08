@@ -1,0 +1,3 @@
+kind: Security
+body: Voer de scan uit zonder credentials, Kubernetes-token of service-links; alleen de leveringsstap krijgt de OAuth-gegevens.
+time: 2026-10-08T12:02:00+02:00

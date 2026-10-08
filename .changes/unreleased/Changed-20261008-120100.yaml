@@ -1,0 +1,3 @@
+kind: Changed
+body: Gebruik één HTTP-client voor register en resultaatendpoint met een OAuth-token als `AUTH_*` is ingesteld, en laad `.env.local` automatisch bij lokaal gebruik.
+time: 2026-10-08T12:01:00+02:00

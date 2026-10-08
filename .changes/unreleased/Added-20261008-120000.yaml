@@ -1,0 +1,3 @@
+kind: Added
+body: Scan repositories in Kubernetes parallel in een Indexed Job met één Pod per repository, een tijdsbudget per repository en rondes binnen de backoff-limiet van het cluster.
+time: 2026-10-08T12:00:00+02:00

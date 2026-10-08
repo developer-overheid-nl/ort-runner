@@ -1,14 +1,14 @@
 # ORT runner
 
-Een Go-job die repositories ophaalt uit het OSS-register, ze achter elkaar onderzoekt
-met [OSS Review Toolkit (ORT)](https://github.com/oss-review-toolkit/ort) en per
+Een Go-job die repositories ophaalt uit het OSS-register, ze onderzoekt met
+[OSS Review Toolkit (ORT)](https://github.com/oss-review-toolkit/ort) en per
 repository een resultaat naar een instelbaar POST-endpoint stuurt. De pipeline is
 **Analyzer → Advisor (OSV) → Evaluator**. De regels komen uit de afzonderlijk
 versieerbare [ort-config](https://github.com/developer-overheid-nl/ort-config).
 
 De runner en ORT draaien samen in één container. De Go-code roept de bestaande
-`ort`-commands rechtstreeks aan. Lokaal kan één aanroep nog steeds één repository
-of een volledige sequentiële batch verwerken.
+`ort`-commands rechtstreeks aan. Lokaal verwerkt één aanroep één repository of alle
+repositories achter elkaar.
 
 In Kubernetes start een geplande controller één Indexed Job. Iedere worker-Pod
 verwerkt precies één repository. Daardoor kan een zwaar project alleen zijn eigen
@@ -63,8 +63,8 @@ De bestaande `POST /repositories` registreert repositories en is niet het doel v
 scanresultaten.
 
 URLs zijn ook in te stellen met `ORT_REPOSITORIES_URL` en `ORT_RESULTS_URL`; CLI-opties
-gaan voor. `--http-timeout` geldt per GET/POST en is standaard `30s`. Voor elk
-verzoek vraagt de runner zelf een token aan, bewaart dat tijdens de job en
+gaan voor. `--http-timeout` geldt per GET/POST en is standaard `30s`. Met
+OAuth-gegevens vraagt de runner zelf een token aan, bewaart dat tijdens de job en
 vernieuwt het voor afloop. De gedeelde implementatie staat in
 `don-register-common/auth`. Credentials worden niet aan Git of ORT doorgegeven.
 `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` en `AUTH_CLIENT_SECRET` moeten samen ingevuld
@@ -134,7 +134,7 @@ de POST maximaal vijf keer; de scan zelf wordt daarbij niet herhaald.
 
 De Kubernetes-uitvoering vereist serverversie **1.33 of nieuwer** vanwege
 `backoffLimitPerIndex`. Een eerste controllerpoging leest de repositorylijst en
-slaat die met de ORT-configuratie op in onveranderlijke ConfigMaps. Een herstarte
+slaat die met de ORT-regels (`evaluator.rules.kts`) op in onveranderlijke ConfigMaps. Een herstarte
 controller gebruikt die opgeslagen lijst, ook als het register intussen is
 gewijzigd. Kubernetes bewaart de voortgang in de Indexed Job; er is geen aparte
 database of queue.
@@ -150,8 +150,8 @@ Een worker-Pod heeft twee stappen:
 
 De scan vraagt standaard `200m` CPU, `4Gi` geheugen en `10Gi` tijdelijke opslag
 aan, met limieten van `2000m`, `8Gi` en `30Gi`. ORT krijgt de helft van het
-geheugen als Java-heap (`-XX:MaxRAMPercentage=50`), bij `8Gi` dus `4Gi`. De gemounte Gradle-config begrenst Gradle op `2Gi` heap
-en `512Mi` metaspace, ook als een gescande repository hogere waarden bevat. Een
+geheugen als Java-heap (`-XX:MaxRAMPercentage=50`), bij `8Gi` dus `4Gi`. De
+gemounte Gradle-config begrenst Gradle op `2Gi` heap en `512Mi` metaspace, ook als een gescande repository hogere waarden bevat. Een
 Pod die zijn geheugen- of opslaglimiet overschrijdt, raakt alleen zijn eigen
 repository.
 
@@ -206,11 +206,11 @@ docker run --rm \
   -v ort-config:/target \
   ghcr.io/developer-overheid-nl/ort-config:v0.0.1
 
-mkdir -p ../don-crawler-ort-output
+mkdir -p output
 
 docker run --rm --init \
   -v ort-config:/config:ro \
-  -v "$PWD/../don-crawler-ort-output:/output" \
+  -v "$PWD/output:/output" \
   ort-runner:dev \
   --repository "https://github.com/developer-overheid-nl/don-crawler.git"
 ```
@@ -302,9 +302,9 @@ Hij controleert de echte drie ORT-stappen, resultaten en regelovertredingen.
 De fixtures hebben geen dependencies; ze testen geen live OSV-dekking of alle
 package managers. Test daarvoor ook representatieve projectrepositories.
 
-De GitHub-workflow voert Go-tests en deze containertest uit. Met **Run workflow**
-kun je een kandidaat-image en config-revisie opgeven. Gewone pushes en pull requests
-publiceren geen image.
+De workflow `test.yml` voert Go-tests en deze containertest uit. Met **Run workflow**
+kun je een kandidaat-image en config-revisie opgeven. Welke workflows images
+publiceren, staat onder [Releasen en deployen](#releasen-en-deployen).
 
 ## Releasen en deployen
 
@@ -316,11 +316,15 @@ Er zijn drie workflows:
 | `deploy-test.yml` | push met `[deploy-test]` in de commitmelding, of handmatig | image `:test` en `:<commit-sha>` publiceren en de test-overlay in `don-infra` bijwerken |
 | `deploy-prod.yml` | push naar `main`, of handmatig | na de Go-tests image `:latest` en `:<commit-sha>` publiceren en een release-PR in `don-infra` openen |
 
-Een versie-release maak je met:
+Wijzigingen voor de changelog leg je vast met [Changie](https://github.com/miniscruff/changie):
+`changie new` bij elke pull request. Een versie-release maak je met:
 
 ```sh
+changie batch v0.1.0
+changie merge
+git commit -am "release: v0.1.0"
 git tag v0.1.0
-git push origin v0.1.0
+git push origin develop v0.1.0
 ```
 
 ## Ontwikkelen
@@ -329,8 +333,8 @@ Gebruik de Go-versie uit `go.mod` en Git. Go voert de passende toolchain automat
 uit wanneer toolchain-downloads zijn ingeschakeld.
 
 ```sh
-go test -race ./...
-go vet ./...
+go test -race ./cmd/... ./internal/...
+go vet ./cmd/... ./internal/...
 go build -o bin/ort-runner ./cmd/ort-runner
 ```
 
@@ -340,3 +344,14 @@ doorlopen na fouten, exacte/defaultbranch-commits, submodules, time-outs, ontbre
 output en het onderscheid tussen bevindingen en uitvoeringsproblemen.
 Voor rechtstreeks lokaal uitvoeren op Linux/macOS moeten Git en ORT geïnstalleerd
 zijn; via `--ort-binary` kun je een specifieke ORT-installatie aanwijzen.
+
+## Bijdragen
+
+Zie [CONTRIBUTING.md](CONTRIBUTING.md). Meld beveiligingsproblemen volgens
+[SECURITY.md](SECURITY.md). Dit project hanteert een [gedragscode](CODE_OF_CONDUCT.md).
+Wijzigingen per versie staan in [CHANGELOG.md](CHANGELOG.md).
+
+## Licentie
+
+De ORT-runner is beschikbaar onder de [European Union Public Licence 1.2](LICENSE)
+(EUPL-1.2). Copyright: Geonovum.
