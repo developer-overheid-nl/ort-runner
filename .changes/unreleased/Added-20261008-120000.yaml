@@ -1,0 +1,3 @@
+kind: Added
+body: Scan repositories in Kubernetes parallel met één Pod per repository, een tijdsbudget per repository en rondes binnen de backoff-limiet van het cluster; de scan draait zonder credentials, één HTTP-client gebruikt OAuth als `AUTH_*` is ingesteld en `golang.org/x/text` is bijgewerkt voor GO-2026-6629.
+time: 2026-10-08T12:00:00+02:00

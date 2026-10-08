@@ -1,0 +1,49 @@
+publiccodeYmlVersion: "0.7"
+
+name: DON ORT-runner
+url: "https://github.com/developer-overheid-nl/ort-runner"
+softwareType: standalone/backend
+developmentStatus: beta
+
+platforms:
+  - linux
+
+categories:
+  - compliance-management
+
+description:
+  nl:
+    shortDescription: >-
+      Scant open source repositories van de overheid met OSS Review Toolkit
+
+    longDescription: |
+      De DON ORT-runner haalt de repositories uit het OSS-register van
+      developer.overheid.nl en onderzoekt ze met OSS Review Toolkit (ORT).
+      Per repository worden de dependencies geanalyseerd, bekende
+      kwetsbaarheden opgezocht via OSV en basisregels voor open source
+      projecten gecontroleerd, zoals een licentie, README, publiccode.yml
+      en SECURITY.md. In Kubernetes scant de runner repositories parallel,
+      elk in een eigen Pod.
+
+legal:
+  license: EUPL-1.2
+  mainCopyrightOwner: Geonovum
+
+intendedAudience:
+  countries:
+    - NL
+  scope:
+    - government
+
+localisation:
+  availableLanguages:
+    - nl
+  localisationReady: false
+
+maintenance:
+  type: internal
+
+  contacts:
+    - name: developer.overheid.nl
+      email: developer.overheid@geonovum.nl
+      affiliation: Geonovum

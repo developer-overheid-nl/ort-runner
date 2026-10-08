@@ -1,1 +1,357 @@
-# ort-runner
+# ORT runner
+
+Een Go-job die repositories ophaalt uit het OSS-register, ze onderzoekt met
+[OSS Review Toolkit (ORT)](https://github.com/oss-review-toolkit/ort) en per
+repository een resultaat naar een instelbaar POST-endpoint stuurt. De pipeline is
+**Analyzer → Advisor (OSV) → Evaluator**. De regels komen uit de afzonderlijk
+versieerbare [ort-config](https://github.com/developer-overheid-nl/ort-config).
+
+De runner en ORT draaien samen in één container. De Go-code roept de bestaande
+`ort`-commands rechtstreeks aan. Lokaal verwerkt één aanroep één repository of alle
+repositories achter elkaar.
+
+In Kubernetes start een geplande controller één Indexed Job. Iedere worker-Pod
+verwerkt precies één repository. Daardoor kan een zwaar project alleen zijn eigen
+worker laten mislukken en begint een herstart van de controller niet opnieuw bij
+repository één. `controller`, `worker` en `deliver` zijn interne
+deploymentcommando's; lokaal start je de runner met `go run ./cmd/ort-runner` en
+blijven `--repository` en `--repositories-url` de ingangen.
+
+## Repositories uit het register verwerken
+
+Het bestaande endpoint is `GET /oss-register/v1/repositories`. De response is een
+JSON-array met onder andere `id` en `url`. De runner haalt eerst alle pagina's op
+met `page`, `perPage=100` en de `Total-Pages`-header. Filters in de opgegeven URL
+blijven behouden. Een eventueel bestaand `publiccode`-filter wordt vervangen. De
+runner haalt zowel de basis-URL als dezelfde URL met `publiccode=false` op en voegt
+beide verzamelingen samen op repository-id. Overlap
+wordt één keer gescand. Bij een scanfout gaat hij door met de volgende repository.
+
+Het register levert geen commit-SHA. Bij iedere checkout haalt de runner de
+defaultbranch op en legt de werkelijk gescande commit vast in het resultaat.
+Repositories uit het register moeten een HTTP(S)-Git-URL hebben.
+
+Benodigd: Docker en een configuratievolume. Vul dit volume vanuit een release van
+`ort-config`; een lokale checkout is daardoor niet nodig. Stel voor de register-GET
+`ORT_REGISTER_API_KEY` in. Met de OAuth-gegevens `AUTH_TOKEN_URL`,
+`AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET` en `AUTH_SCOPES` krijgen alle verzoeken een
+token, net als bij de andere registers.
+
+Met `go run ./cmd/ort-runner` laadt de runner `.env.local` uit de huidige map
+automatisch. Al ingestelde variabelen, zoals die van een Kubernetes-Pod, gaan voor.
+
+```sh
+docker build -t ort-runner:dev .
+mkdir -p output
+docker volume create ort-config
+docker run --rm \
+  -v ort-config:/target \
+  ghcr.io/developer-overheid-nl/ort-config:v0.0.1
+
+docker run --rm --init \
+  --env-file .env.local \
+  -v ort-config:/config:ro \
+  -v "$PWD/output:/output" \
+  ort-runner:dev \
+  --repositories-url "https://api.developer.overheid.nl/oss-register/v1/repositories"
+```
+
+**Het POST-endpoint bestaat nog niet.** Laat `ORT_RESULTS_URL` voorlopig leeg:
+dan bewaart de runner de te versturen berichten lokaal. Zodra het endpoint bestaat,
+stel je `ORT_RESULTS_URL` in op het volledige adres, of gebruik je `--results-url`.
+De bestaande `POST /repositories` registreert repositories en is niet het doel voor
+scanresultaten.
+
+URLs zijn ook in te stellen met `ORT_REPOSITORIES_URL` en `ORT_RESULTS_URL`; CLI-opties
+gaan voor. `--http-timeout` geldt per GET/POST en is standaard `30s`. Met
+OAuth-gegevens vraagt de runner zelf een token aan, bewaart dat tijdens de job en
+vernieuwt het voor afloop. De gedeelde implementatie staat in
+`don-register-common/auth`. Credentials worden niet aan Git of ORT doorgegeven.
+`AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` en `AUTH_CLIENT_SECRET` moeten samen ingevuld
+zijn. `AUTH_SCOPES` is optioneel en mag leeg blijven; meerdere scopes worden met
+spaties gescheiden.
+
+### Voorstel voor het POST-bericht
+
+Per repository wordt één JSON-bericht verstuurd, ook als de scan mislukt. Het bevat
+`schemaVersion: 1`, het register-id in `repositoryId` en het volledige `run.json`-object
+onder `scan`. Dit is het voorlopige contract voor het nog te bouwen endpoint.
+Ingekort voorbeeld:
+
+```json
+{
+  "schemaVersion": 1,
+  "repositoryId": "id-uit-het-register",
+  "scan": {
+    "status": "completed",
+    "repository": "https://github.com/example/project",
+    "revision": "0123456789012345678901234567890123456789",
+    "vulnerabilities": [
+      {
+        "package_id": "Go::example.org/module:1.0.0",
+        "id": "GO-2026-1234",
+        "summary": "Example vulnerability",
+        "severity": "HIGH",
+        "score": 7.5,
+        "scoring_system": "CVSS3",
+        "first_fixed_versions": ["1.1.0"]
+      }
+    ],
+    "findings": [
+      {"rule": "MISSING_SECURITY_FILE", "severity": "ERROR", "message": "Missing SECURITY.md"}
+    ]
+  }
+}
+```
+
+### Batchresultaten
+
+```text
+batch-123456/
+├── batch.json
+└── repository-234567/
+    ├── submission.json
+    └── run-345678/
+        ├── run.json
+        ├── analyzer-result.yml
+        ├── advisor-result.yml
+        ├── evaluation-result.yml
+        └── ...logs
+```
+
+`submission.json` bevat exact het verstuurde of nog te versturen bericht. In
+`batch.json` staan alle verwerkte register-id's met hun scanstatus en afleverstatus:
+`posted`, `failed`, `not_configured` of `pending` bij een afgebroken batch.
+
+Een mislukte POST maakt de lokale, sequentiële batch onvolledig, bewaart het bericht
+en stopt de overige scans niet. Deze modus doet geen automatische POST-retries. Een
+volgende batch scant opnieuw; bewaarde berichten worden niet automatisch opnieuw
+verstuurd. Een fout bij het ophalen van de lijst stopt de batch voordat er scans
+starten. Kubernetes-workers gebruiken een vaste idempotency-key en proberen alleen
+de POST maximaal vijf keer; de scan zelf wordt daarbij niet herhaald.
+
+## Kubernetes-uitvoering
+
+De Kubernetes-uitvoering vereist serverversie **1.33 of nieuwer** vanwege
+`backoffLimitPerIndex`. Een eerste controllerpoging leest de repositorylijst en
+slaat die met de ORT-regels (`evaluator.rules.kts`) op in onveranderlijke ConfigMaps. Een herstarte
+controller gebruikt die opgeslagen lijst, ook als het register intussen is
+gewijzigd. Kubernetes bewaart de voortgang in de Indexed Job; er is geen aparte
+database of queue.
+
+Een worker-Pod heeft twee stappen:
+
+1. **Scan** (`ort-runner worker`, init-container): checkout en ORT. Deze stap voert
+   code van de gescande repository uit en krijgt daarom geen credentials,
+   ServiceAccount-token of service-links.
+2. **Levering** (`ort-runner deliver`, kleine container): stuurt `submission.json`
+   met een vaste idempotency-key (`ort:<sha256>`) naar `ORT_RESULTS_URL` en probeert
+   dat maximaal vijf keer. Alleen deze stap krijgt de OAuth-gegevens.
+
+De scan vraagt standaard `200m` CPU, `4Gi` geheugen en `10Gi` tijdelijke opslag
+aan, met limieten van `2000m`, `8Gi` en `30Gi`. ORT krijgt de helft van het
+geheugen als Java-heap (`-XX:MaxRAMPercentage=50`), bij `8Gi` dus `4Gi`. De
+gemounte Gradle-config begrenst Gradle op `2Gi` heap en `512Mi` metaspace, ook als een gescande repository hogere waarden bevat. Een
+Pod die zijn geheugen- of opslaglimiet overschrijdt, raakt alleen zijn eigen
+repository.
+
+Een scan heeft een tijdsbudget per repository (`ORT_REPOSITORY_TIMEOUT`, standaard
+`10m`) voor checkout, analyze, advise en evaluate samen. Wordt dat overschreden,
+dan stopt ORT en wordt de repository als mislukt vastgelegd; Kubernetes probeert
+hem dan niet opnieuw.
+
+Een Pod mislukt alleen bij een OOM-kill, eviction of uitgevallen node. Die
+repository wordt niet opnieuw geprobeerd binnen dezelfde ronde
+(`backoffLimitPerIndex: 0`). Een worker-Job stopt na meer dan 10 mislukte Pods:
+`backoffLimit: 10`, het maximum dat de tenant-policy van het cluster toestaat.
+De controller start dan een nieuwe ronde met alleen de repositories die nog niet
+klaar waren. Dat gebeurt tot alles klaar is, een ronde niets oplevert of
+`ORT_BATCH_DEADLINE` is verstreken. Repositories die dan niet zijn afgerond, gelden
+als mislukt en worden bij een ingesteld resultaatendpoint als mislukt gemeld.
+
+Worker-Jobs horen bij de controller-Job en worden samen met die Job opgeruimd.
+Een herstarte controller maakt een afgeronde ronde nooit opnieuw aan; ontbreekt
+de Job van zo'n ronde, dan stopt hij met een foutmelding. Tijdelijke API-fouten
+tijdens het wachten logt hij en probeert hij opnieuw.
+
+```sh
+kubectl -n tn-don-oss-test get job <worker-job> \
+  -o jsonpath='{.status.completedIndexes}{"\n"}{.status.failedIndexes}{"\n"}'
+```
+
+De belangrijkste controllerwaarden zijn:
+
+| Omgevingsvariabele | Standaard |
+| --- | --- |
+| `ORT_PARALLELISM` | `10` |
+| `ORT_BATCH_DEADLINE` | `46h` |
+| `ORT_REPOSITORY_TIMEOUT` | `10m` |
+| `ORT_WORKER_CPU_REQUEST` / `ORT_WORKER_CPU_LIMIT` | `200m` / `2000m` |
+| `ORT_WORKER_MEMORY_REQUEST` / `ORT_WORKER_MEMORY_LIMIT` | `4Gi` / `8Gi` |
+| `ORT_WORKER_EPHEMERAL_STORAGE_REQUEST` / `ORT_WORKER_EPHEMERAL_STORAGE_LIMIT` | `10Gi` / `30Gi` |
+
+Zonder `ORT_RESULTS_URL` logt de leveringsstap alleen de uitkomst; de submission
+verdwijnt met de Pod. Een productie-inrichting vereist daarom eerst een
+resultaatendpoint.
+
+## Eén repository testen
+
+Benodigd: Docker, Git en een gevuld `ort-config`-volume. Zonder `--revision`
+controleert de runner de laatste commit van de default branch.
+
+```sh
+docker build -t ort-runner:dev .
+docker volume create ort-config
+docker run --rm \
+  -v ort-config:/target \
+  ghcr.io/developer-overheid-nl/ort-config:v0.0.1
+
+mkdir -p output
+
+docker run --rm --init \
+  -v ort-config:/config:ro \
+  -v "$PWD/output:/output" \
+  ort-runner:dev \
+  --repository "https://github.com/developer-overheid-nl/don-crawler.git"
+```
+
+Voor een lokale Git-repository kun je die extra read-only mounten en bijvoorbeeld
+`--repository file:///source` meegeven. Deze mount moet gedurende alle drie de
+ORT-stappen beschikbaar blijven.
+
+Gebruik `docker run --rm ort-runner:dev --help` voor alle opties. De belangrijkste:
+
+| Optie | Betekenis | Standaard |
+| --- | --- | --- |
+| `--repositories-url` | GET-endpoint voor een batch | `ORT_REPOSITORIES_URL` |
+| `--results-url` | POST-endpoint voor batchresultaten | `ORT_RESULTS_URL`, anders alleen lokaal bewaren |
+| `--repository` | Git-URL of lokaal Git-pad voor een losse scan | verplicht bij losse scan |
+| `--revision` | Volledige commit-SHA van 40 tekens | laatste commit van de default branch |
+| `--config-dir` | ORT-configuratie | `/config` |
+| `--output-dir` | Bovenliggende map voor scanresultaten | `/output` |
+| `--stage-timeout` | Maximale duur per checkout of ORT-stap | `30m` |
+
+De checkout bevat ook submodules op hun vastgelegde commits. Per scan maakt de runner
+een tijdelijke kopie van de configuratie en legt daarvan een SHA-256-vingerafdruk vast.
+Gebruik voor herhaalbare scans steeds dezelfde config-release of hetzelfde image-digest.
+De configuratiemap hoeft alleen een regulier bestand `evaluator.rules.kts` te bevatten.
+
+## Resultaten en exitcodes
+
+Elke losse scan maakt een nieuwe `run-*`-map onder de outputmap. Binnen een batch
+staat deze map onder de bijbehorende `repository-*`-map:
+
+```text
+run-123456/
+├── run.json
+├── checkout.log
+├── analyze.log
+├── advise.log
+├── evaluate.log
+├── analyzer-result.yml
+├── advisor-result.yml
+└── evaluation-result.yml
+```
+
+`run.json` bevat de commit, config-vingerafdruk, image, ORT-versies, tijden, status
+en exitcode per stap, de OSV-kwetsbaarheden en de regelovertredingen. Per kwetsbaarheid
+worden het package, advisory-id, samenvatting, beschikbare score en eerste opgeloste
+versies opgenomen. Bij een fout blijven reeds gemaakte resultaten en logs bewaard.
+De tijdelijke broncode en config-kopie worden opgeruimd.
+
+| Runner-exitcode | Betekenis |
+| --- | --- |
+| `0` | Alle scans afgerond, eventueel met regelovertredingen; ingestelde POSTs geaccepteerd |
+| `1` | Scan, batch of verzending onvolledig/mislukt; zie `batch.json`, `run.json` en logs |
+| `2` | Verplichte CLI-optie ontbreekt, onbekende optie of conflicterende modi |
+
+Zonder ingesteld POST-endpoint betekent exitcode `0` dat de resultaten lokaal zijn
+bewaard. De afleverstatus blijft dan `not_configured`.
+
+Evaluator-exitcode `2` met regelovertredingen is een afgeronde evaluatie: bijvoorbeeld
+een ontbrekend `SECURITY.md` wordt een bevinding. Analyzer- of Advisor-problemen
+maken de scan onvolledig. Als hun resultaat bruikbaar is, gaan volgende stappen
+wel door, zodat ook de repositoryregels nog uitgevoerd kunnen worden. Een ontbrekend
+of onleesbaar resultaat stopt de vervolgstappen.
+
+`completed` beschrijft de uitvoering; het is geen verklaring dat een project veilig
+of volledig onderzocht is. `package_count: 0` betekent dat geen dependencies zijn
+gevonden. Sommige OSV-fouten in ORT 92.4.0 verschijnen alleen in logs; de runner kan
+alleen problemen classificeren die ORT in exitcodes of resultaten teruggeeft.
+De huidige pipeline bevat geen Scanner-stap en hydrateert Git LFS-bestanden niet.
+
+## ORT-versies afzonderlijk testen
+
+De Dockerfile gebruikt ORT `92.4.0`, vastgezet met een image-digest. Bouw een kandidaat
+door alleen het buildargument te wijzigen:
+
+```sh
+docker build \
+  --build-arg ORT_IMAGE=ghcr.io/oss-review-toolkit/ort:92.4.0 \
+  --build-arg RUNNER_VERSION="$(git rev-parse HEAD)" \
+  -t ort-runner:candidate .
+
+ORT_RUNNER_TEST_IMAGE=ort-runner:candidate \
+ORT_RUNNER_TEST_CONFIG_DIR="$PWD/../ort-config" \
+  go test -tags=integration ./internal/runner -run TestContainerBaseline -count=1 -timeout=20m -v
+```
+
+Vervang de image door de gewenste tag of digest. De containertest gebruikt twee
+kleine Git-fixtures: alle basisbestanden aanwezig, en één ontbrekend `SECURITY.md`.
+Hij controleert de echte drie ORT-stappen, resultaten en regelovertredingen.
+De fixtures hebben geen dependencies; ze testen geen live OSV-dekking of alle
+package managers. Test daarvoor ook representatieve projectrepositories.
+
+De workflow `test.yml` voert Go-tests en deze containertest uit. Met **Run workflow**
+kun je een kandidaat-image en config-revisie opgeven. Welke workflows images
+publiceren, staat onder [Releasen en deployen](#releasen-en-deployen).
+
+## Releasen en deployen
+
+Er zijn drie workflows:
+
+| Workflow | Start bij | Doet |
+| --- | --- | --- |
+| `test.yml` | push naar `main` of `develop`, pull request, tag `v*.*.*` | Go-tests en de ORT-containertest; bij een tag daarna het multi-platform image `:<tag>` en `:<commit-sha>` publiceren en een GitHub Release maken |
+| `deploy-test.yml` | push met `[deploy-test]` in de commitmelding, of handmatig | image `:test` en `:<commit-sha>` publiceren en de test-overlay in `don-infra` bijwerken |
+| `deploy-prod.yml` | push naar `main`, of handmatig | na de Go-tests image `:latest` en `:<commit-sha>` publiceren en een release-PR in `don-infra` openen |
+
+Wijzigingen voor de changelog leg je vast met [Changie](https://github.com/miniscruff/changie):
+`changie new` bij elke pull request. Een versie-release maak je met:
+
+```sh
+changie batch v0.1.0
+changie merge
+git commit -am "release: v0.1.0"
+git tag v0.1.0
+git push origin develop v0.1.0
+```
+
+## Ontwikkelen
+
+Gebruik de Go-versie uit `go.mod` en Git. Go voert de passende toolchain automatisch
+uit wanneer toolchain-downloads zijn ingeschakeld.
+
+```sh
+go test -race ./cmd/... ./internal/...
+go vet ./cmd/... ./internal/...
+go build -o bin/ort-runner ./cmd/ort-runner
+```
+
+De Go-tests gebruiken echte tijdelijke Git-repositories, lokale HTTP-testservers en
+een testprogramma voor de ORT-procesgrens. Ze testen paginering, POST-berichten,
+doorlopen na fouten, exacte/defaultbranch-commits, submodules, time-outs, ontbrekende
+output en het onderscheid tussen bevindingen en uitvoeringsproblemen.
+Voor rechtstreeks lokaal uitvoeren op Linux/macOS moeten Git en ORT geïnstalleerd
+zijn; via `--ort-binary` kun je een specifieke ORT-installatie aanwijzen.
+
+## Bijdragen
+
+Zie [CONTRIBUTING.md](CONTRIBUTING.md). Meld beveiligingsproblemen volgens
+[SECURITY.md](SECURITY.md). Dit project hanteert een [gedragscode](CODE_OF_CONDUCT.md).
+Wijzigingen per versie staan in [CHANGELOG.md](CHANGELOG.md).
+
+## Licentie
+
+De ORT-runner is beschikbaar onder de [European Union Public Licence 1.2](LICENSE)
+(EUPL-1.2). Copyright: Geonovum.
