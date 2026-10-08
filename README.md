@@ -33,9 +33,12 @@ Repositories uit het register moeten een HTTP(S)-Git-URL hebben.
 
 Benodigd: Docker en een configuratievolume. Vul dit volume vanuit een release van
 `ort-config`; een lokale checkout is daardoor niet nodig. Stel voor de register-GET
-`ORT_REGISTER_API_KEY` in. De OAuth-gegevens `AUTH_TOKEN_URL`,
-`AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET` en `AUTH_SCOPES` zijn uitsluitend voor de
-resultaat-POST.
+`ORT_REGISTER_API_KEY` in. Met de OAuth-gegevens `AUTH_TOKEN_URL`,
+`AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET` en `AUTH_SCOPES` krijgen alle verzoeken een
+token, net als bij de andere registers.
+
+Met `go run ./cmd/ort-runner` laadt de runner `.env.local` uit de huidige map
+automatisch. Al ingestelde variabelen, zoals die van een Kubernetes-Pod, gaan voor.
 
 ```sh
 docker build -t ort-runner:dev .
@@ -56,13 +59,12 @@ docker run --rm --init \
 **Het POST-endpoint bestaat nog niet.** Laat `ORT_RESULTS_URL` voorlopig leeg:
 dan bewaart de runner de te versturen berichten lokaal. Zodra het endpoint bestaat,
 stel je `ORT_RESULTS_URL` in op het volledige adres, of gebruik je `--results-url`.
-De OAuth-client verzorgt straks uitsluitend de authenticatie van de POST. De
-bestaande `POST /repositories` registreert repositories en is niet het doel voor
+De bestaande `POST /repositories` registreert repositories en is niet het doel voor
 scanresultaten.
 
 URLs zijn ook in te stellen met `ORT_REPOSITORIES_URL` en `ORT_RESULTS_URL`; CLI-opties
-gaan voor. `--http-timeout` geldt per GET/POST en is standaard `30s`. Voor een
-resultaat-POST vraagt de runner zelf een token aan, bewaart dat tijdens de job en
+gaan voor. `--http-timeout` geldt per GET/POST en is standaard `30s`. Voor elk
+verzoek vraagt de runner zelf een token aan, bewaart dat tijdens de job en
 vernieuwt het voor afloop. De gedeelde implementatie staat in
 `don-register-common/auth`. Credentials worden niet aan Git of ORT doorgegeven.
 `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` en `AUTH_CLIENT_SECRET` moeten samen ingevuld

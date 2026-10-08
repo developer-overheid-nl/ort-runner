@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +22,10 @@ var version = "dev"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	if err := loadLocalEnv(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	os.Exit(execute(ctx, os.Args[1:], os.Stdout, os.Stderr))
@@ -78,7 +81,9 @@ func executeLocal(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			return 2
 		}
 		batch.Runner = cfg
-		if err := configureBatchHTTPClients(ctx, &batch); err != nil {
+		var err error
+		settings := httpSettings{Timeout: batch.HTTPTimeout, Auth: (&env{}).auth()}
+		if batch.HTTPClient, err = newHTTPClient(ctx, settings); err != nil {
 			fmt.Fprintf(stderr, "Configure client credentials: %v\n", err)
 			return 2
 		}
@@ -107,31 +112,13 @@ func executeLocal(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	return 0
 }
 
-func configureBatchHTTPClients(ctx context.Context, config *runner.BatchConfig) error {
-	base := &http.Client{Timeout: config.HTTPTimeout}
-	config.RegisterHTTPClient = base
-	if config.ResultsURL == "" {
-		config.ResultsHTTPClient = base
-		return nil
-	}
-	authenticated, err := newResultsHTTPClient(ctx, config.HTTPTimeout)
-	if err != nil {
-		return err
-	}
-	config.ResultsHTTPClient = authenticated
-	return nil
-}
-
-func newResultsHTTPClient(ctx context.Context, timeout time.Duration) (*http.Client, error) {
-	base := &http.Client{Timeout: timeout}
-	authConfig := commonauth.ClientCredentialsConfig{
-		TokenURL:     os.Getenv("AUTH_TOKEN_URL"),
-		ClientID:     os.Getenv("AUTH_CLIENT_ID"),
-		ClientSecret: os.Getenv("AUTH_CLIENT_SECRET"),
-		Scopes:       strings.Fields(os.Getenv("AUTH_SCOPES")),
-	}
-	if authConfig.TokenURL == "" && authConfig.ClientID == "" && authConfig.ClientSecret == "" {
+// newHTTPClient returns the client for the register and the result endpoint.
+// With AUTH_* set it adds an OAuth client-credentials token, like the other
+// registers do.
+func newHTTPClient(ctx context.Context, settings httpSettings) (*http.Client, error) {
+	base := &http.Client{Timeout: settings.Timeout}
+	if settings.Auth.TokenURL == "" && settings.Auth.ClientID == "" && settings.Auth.ClientSecret == "" {
 		return base, nil
 	}
-	return commonauth.NewClientCredentialsHTTPClient(ctx, authConfig, base)
+	return commonauth.NewClientCredentialsHTTPClient(ctx, settings.Auth, base)
 }

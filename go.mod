@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/developer-overheid-nl/don-register-common v0.3.0
+	github.com/joho/godotenv v1.5.1
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.33.5
 	k8s.io/apimachinery v0.33.5

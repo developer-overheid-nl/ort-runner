@@ -26,8 +26,8 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-// ConfigMaps are limited to 1 MiB; the margin leaves room for metadata.
-const manifestChunkLimit = 700 << 10
+// A ConfigMap holds at most 1 MiB; 700 KiB per chunk leaves room for metadata.
+const manifestChunkLimit = 700 * 1024
 
 type ControllerConfig struct {
 	Namespace       string

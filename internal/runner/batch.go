@@ -62,17 +62,12 @@ func runBatch(ctx context.Context, cfg BatchConfig, scan func(context.Context, C
 	if err := save(); err != nil {
 		return report, err
 	}
-	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	registerHTTPClient := cfg.RegisterHTTPClient
-	if registerHTTPClient == nil {
-		registerHTTPClient = client
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: cfg.HTTPTimeout}
 	}
-	resultsHTTPClient := cfg.ResultsHTTPClient
-	if resultsHTTPClient == nil {
-		resultsHTTPClient = client
-	}
-	source := register.Client{HTTP: registerHTTPClient, APIKey: cfg.RegisterAPIKey}
-	destination := register.Client{HTTP: resultsHTTPClient}
+	source := register.Client{HTTP: client, APIKey: cfg.RegisterAPIKey}
+	destination := register.Client{HTTP: client}
 	// Read all pages before lengthy scans, keeping list retrieval close together in time.
 	repositories, err := source.RepositorySets(ctx, cfg.RepositoriesURL)
 	if err != nil {

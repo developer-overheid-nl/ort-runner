@@ -56,7 +56,7 @@ func TestCLIRegisterModeUsesEnvironmentAndWritesBatch(t *testing.T) {
 			fmt.Fprint(w, `{"access_token":"read-token","token_type":"Bearer","expires_in":3600}`)
 			return
 		}
-		if r.URL.Path != "/repositories" || r.Header.Get("X-Api-Key") != "read-key" || r.Header.Get("Authorization") != "" {
+		if r.URL.Path != "/repositories" || r.Header.Get("X-Api-Key") != "read-key" {
 			t.Errorf("incorrect register request")
 		}
 		w.Header().Set("Total-Pages", "0")

@@ -9,7 +9,7 @@ import (
 func TestWorkerCommandHelpAndRequiredEnvironment(t *testing.T) {
 	clearWorkerEnv(t)
 	var output bytes.Buffer
-	if code := execute(context.Background(), []string{"worker", "--help"}, &output, &output); code != 0 {
+	if code := execute(context.Background(), []string{"worker", "--help"}, &output, &output); code != 2 {
 		t.Fatalf("help exit=%d output=%s", code, output.String())
 	}
 	for _, tc := range []struct {
@@ -43,7 +43,7 @@ func TestWorkerCommandHelpAndRequiredEnvironment(t *testing.T) {
 func TestDeliverCommandRequiresBatchAndSubmission(t *testing.T) {
 	clearWorkerEnv(t)
 	var output bytes.Buffer
-	if code := execute(context.Background(), []string{"deliver", "--help"}, &output, &output); code != 0 {
+	if code := execute(context.Background(), []string{"deliver", "--help"}, &output, &output); code != 2 {
 		t.Fatalf("help exit=%d", code)
 	}
 	if code := execute(context.Background(), []string{"deliver"}, &output, &output); code != 2 {

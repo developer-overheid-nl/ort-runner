@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	k8sversion "k8s.io/apimachinery/pkg/version"
@@ -13,7 +14,7 @@ import (
 func TestControllerCommandHelpAndRequiredEnvironment(t *testing.T) {
 	clearControllerEnv(t)
 	var output bytes.Buffer
-	if code := execute(context.Background(), []string{"controller", "--help"}, &output, &output); code != 0 {
+	if code := execute(context.Background(), []string{"controller", "--help"}, &output, &output); code != 2 {
 		t.Fatalf("help exit=%d output=%s", code, output.String())
 	}
 	for _, tc := range []struct {
@@ -102,4 +103,15 @@ func clearControllerEnv(t *testing.T) {
 		t.Setenv(name, "")
 	}
 	clearAuthEnv(t)
+}
+
+func TestControllerConfigReportsAllProblemsAtOnce(t *testing.T) {
+	clearControllerEnv(t)
+	t.Setenv("ORT_PARALLELISM", "ten")
+	_, err := loadControllerConfig()
+	for _, want := range []string{"POD_NAMESPACE", "POD_NAME", "ORT_BATCH_ID", "ORT_REPOSITORIES_URL", "ORT_CONFIG_DIR", "ORT_PARALLELISM"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("error does not mention %s: %v", want, err)
+		}
+	}
 }

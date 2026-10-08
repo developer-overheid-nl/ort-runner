@@ -6,13 +6,14 @@ import (
 )
 
 type BatchConfig struct {
-	RepositoriesURL    string
-	ResultsURL         string
-	RegisterAPIKey     string
-	RegisterHTTPClient *http.Client
-	ResultsHTTPClient  *http.Client
-	HTTPTimeout        time.Duration
-	Runner             Config
+	RepositoriesURL string
+	ResultsURL      string
+	RegisterAPIKey  string
+	// HTTPClient is used for the register and the result endpoint; nil means a
+	// plain client with HTTPTimeout.
+	HTTPClient  *http.Client
+	HTTPTimeout time.Duration
+	Runner      Config
 }
 
 type Submission struct {
