@@ -11,17 +11,24 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/developer-overheid-nl/ort-runner/internal/register"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
+
+func init() {
+	// The fake client needs no 30-second pause between polls.
+	jobPollInterval = time.Millisecond
+}
 
 func TestParseIndexes(t *testing.T) {
 	got, err := ParseIndexes("0,2-4,7", 8)
@@ -115,16 +122,8 @@ func TestRunControllerRejectsConflictingResources(t *testing.T) {
 	}{
 		{name: "digest", mutate: func(maps []*corev1.ConfigMap, _ *batchv1.Job) { maps[0].Labels[resourceDigestLabel] = "wrong" }},
 		{name: "owner", mutate: func(maps []*corev1.ConfigMap, _ *batchv1.Job) { maps[0].OwnerReferences[0].UID = "other" }},
-		{name: "image", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { job.Spec.Template.Spec.Containers[0].Image = "other" }},
-		{name: "completions", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.Completions = 2 }},
-		{name: "cleanup TTL", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.TTLSecondsAfterFinished = 60 }},
-		{name: "backoff limit", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { *job.Spec.BackoffLimit = 6 }},
-		{name: "scan image", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) {
-			job.Spec.Template.Spec.InitContainers[0].Image = "other"
-		}},
-		{name: "environment", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) {
-			job.Spec.Template.Spec.Containers[0].Env[0].Value = "other"
-		}},
+		{name: "job spec", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { job.Annotations[specHashAnnotation] = "other" }},
+		{name: "job owner", mutate: func(_ []*corev1.ConfigMap, job *batchv1.Job) { job.OwnerReferences[0].UID = "other" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			objects := []runtime.Object{controllerPod().DeepCopy()}
@@ -192,7 +191,7 @@ func TestRunControllerRestartKeepsStoredManifestWhenRegisterChanges(t *testing.T
 	owner := controllerPod().OwnerReferences[0]
 	maps, err := BuildConfigMaps(owner, "oss", WorkerResources{
 		Image: "ghcr.io/example/ort-runner@sha256:1234", BatchID: cfg.BatchName, RepositoryCount: 1,
-		ConfigData: map[string][]byte{"evaluator.rules.kts": []byte("licenseRule {}")}, ManifestChunks: chunks, Settings: cfg.Settings,
+		Rules: []byte("licenseRule {}"), ManifestChunks: chunks, Settings: cfg.Settings,
 		RoundDeadline: cfg.Settings.Deadline,
 	})
 	if err != nil {
@@ -304,6 +303,58 @@ func TestRunControllerResumesLaterRoundAfterRestart(t *testing.T) {
 	}
 	if countCreates(client.Actions()) != created {
 		t.Fatal("restart created new batch resources")
+	}
+}
+
+func TestRunControllerNeverRecreatesAFinishedRound(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}, {ID: "b", URL: "https://example.test/b.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	cfg := controllerConfig(t, server.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	client.PrependReactor("create", "jobs", func(action ktesting.Action) (bool, runtime.Object, error) {
+		if strings.Contains(action.(ktesting.CreateAction).GetObject().(*batchv1.Job).Name, "r1-workers") {
+			cancel()
+		}
+		return false, nil, nil
+	})
+	finishJobs(t, client, jobResult{completed: "0", reason: batchv1.JobReasonBackoffLimitExceeded})
+	if _, err := RunController(ctx, client, cfg); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first attempt: %v", err)
+	}
+	// Round 0 is gone, for example removed by hand, while round 1 exists.
+	if err := client.BatchV1().Jobs("oss").Delete(context.Background(), workerJobName(controllerPod().OwnerReferences[0], 0), metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	created := countCreates(client.Actions())
+
+	if _, err := RunController(context.Background(), client, cfg); err == nil || !strings.Contains(err.Error(), "round 0") {
+		t.Fatalf("restart did not refuse to rerun round 0: %v", err)
+	}
+	if countCreates(client.Actions()) != created {
+		t.Fatal("restart recreated batch resources")
+	}
+}
+
+func TestRunControllerSurvivesTransientAPIErrors(t *testing.T) {
+	server := repositoryServer(t, []register.Repository{{ID: "a", URL: "https://example.test/a.git"}})
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	var failures atomic.Int32
+	client.PrependReactor("get", "jobs", func(action ktesting.Action) (bool, runtime.Object, error) {
+		// Fail a few reads once the worker Job exists, as an API server restart would.
+		jobs, _ := client.Tracker().List(batchv1.SchemeGroupVersion.WithResource("jobs"), batchv1.SchemeGroupVersion.WithKind("Job"), "oss")
+		if len(jobs.(*batchv1.JobList).Items) > 0 && failures.Add(1) <= 3 {
+			return true, nil, apierrors.NewServiceUnavailable("API server restarting")
+		}
+		return false, nil, nil
+	})
+	finishJobs(t, client, jobResult{completed: "0"})
+
+	summary, err := RunController(context.Background(), client, controllerConfig(t, server.URL))
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("summary=%+v err=%v", summary, err)
 	}
 }
 

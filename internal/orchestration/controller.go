@@ -3,7 +3,6 @@ package orchestration
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -17,11 +16,9 @@ import (
 	"github.com/developer-overheid-nl/ort-runner/internal/register"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 )
@@ -55,10 +52,6 @@ type BatchSummary struct {
 type FailureReporter interface {
 	ReportFailedIndex(context.Context, string, register.Repository) error
 }
-
-// A round stops early when it reaches jobBackoffLimit; every new round runs only
-// the repositories that did not finish, so the number of rounds stays small.
-const maxRounds = 20
 
 // RunController runs the batch in one or more Indexed Job rounds and waits until
 // every repository has completed or failed. A restarted controller resumes the
@@ -96,14 +89,14 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 	if summary.Total == 0 {
 		return summary, nil
 	}
-	configData, err := readConfigData(cfg.ConfigDir)
+	rules, err := readRules(cfg.ConfigDir)
 	if err != nil {
 		return BatchSummary{}, err
 	}
 	template := WorkerResources{
 		Image:             image,
 		BatchID:           cfg.BatchName,
-		ConfigData:        configData,
+		Rules:             rules,
 		ResultEnvironment: ResultEnvironment(environment),
 		Settings:          cfg.Settings,
 	}
@@ -148,7 +141,7 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 
 		progressed := outcome.completed > 0 || len(outcome.failed) > 0
 		retry := outcome.reason == batchv1.JobReasonBackoffLimitExceeded && progressed &&
-			round+1 < maxRounds && time.Until(batchEnd) >= time.Minute
+			time.Until(batchEnd) >= time.Minute
 		if len(outcome.unfinished) == 0 || !retry {
 			failed = append(failed, outcome.unfinished...)
 			break
@@ -194,6 +187,17 @@ func (b batch) runRound(ctx context.Context, resources WorkerResources) (*batchv
 	desired, err := BuildIndexedJob(b.owner, b.cfg.Namespace, workerJobName(b.owner, resources.Round), resources)
 	if err != nil {
 		return nil, err
+	}
+	if _, err := b.client.BatchV1().Jobs(desired.Namespace).Get(ctx, desired.Name, metav1.GetOptions{}); apierrors.IsNotFound(err) {
+		// A later round only exists once this round finished. Recreating this
+		// round would rescan everything in it, so refuse instead.
+		later, err := storedManifestChunks(ctx, b.client, b.cfg.Namespace, b.owner, resources.Round+1)
+		if err != nil {
+			return nil, err
+		}
+		if later != nil {
+			return nil, fmt.Errorf("Job of round %d no longer exists while round %d does; refusing to rerun round %d", resources.Round, resources.Round+1, resources.Round)
+		}
 	}
 	if err := createOrVerifyJob(ctx, b.client, desired); err != nil {
 		return nil, err
@@ -324,33 +328,16 @@ func inspectControllerPod(pod *corev1.Pod, containerName string) (metav1.OwnerRe
 	return metav1.OwnerReference{}, "", nil, fmt.Errorf("controller container %q not found", containerName)
 }
 
-func readConfigData(root string) (map[string][]byte, error) {
-	data := make(map[string][]byte)
-	err := filepath.WalkDir(root, func(file string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || file == root || entry.IsDir() {
-			return walkErr
-		}
-		if !entry.Type().IsRegular() {
-			return fmt.Errorf("config entry %s is not a regular file", file)
-		}
-		relative, err := filepath.Rel(root, file)
-		if err != nil {
-			return err
-		}
-		contents, err := os.ReadFile(file)
-		if err != nil {
-			return err
-		}
-		data[filepath.ToSlash(relative)] = contents
-		return nil
-	})
+// readRules reads the evaluator rules; it is the only file ORT is given.
+func readRules(configDir string) ([]byte, error) {
+	rules, err := os.ReadFile(filepath.Join(configDir, rulesFile))
 	if err != nil {
-		return nil, fmt.Errorf("read config directory: %w", err)
+		return nil, fmt.Errorf("read %s: %w", rulesFile, err)
 	}
-	if len(data["evaluator.rules.kts"]) == 0 {
-		return nil, fmt.Errorf("config directory must contain evaluator.rules.kts")
+	if len(rules) == 0 {
+		return nil, fmt.Errorf("%s is empty", rulesFile)
 	}
-	return data, nil
+	return rules, nil
 }
 
 // Existing batch resources are never updated: a difference means another
@@ -381,51 +368,10 @@ func createOrVerifyJob(ctx context.Context, client kubernetes.Interface, desired
 	if err != nil {
 		return err
 	}
-	if !sameOwner(existing.OwnerReferences, desired.OwnerReferences[0]) || !containsLabels(existing.Labels, desired.Labels) || !sameJobSpec(existing.Spec, desired.Spec) {
+	if !sameOwner(existing.OwnerReferences, desired.OwnerReferences[0]) || existing.Annotations[specHashAnnotation] != desired.Annotations[specHashAnnotation] {
 		return fmt.Errorf("Job %s conflict", desired.Name)
 	}
 	return nil
-}
-
-// sameJobSpec compares the fields this package sets; fields defaulted by the
-// API server are ignored. ActiveDeadlineSeconds is left out: later rounds get
-// the time left in the batch, which depends on when the Job was created.
-func sameJobSpec(existing, desired batchv1.JobSpec) bool {
-	a, b := existing.Template.Spec, desired.Template.Spec
-	return reflect.DeepEqual(existing.Completions, desired.Completions) &&
-		reflect.DeepEqual(existing.Parallelism, desired.Parallelism) &&
-		reflect.DeepEqual(existing.CompletionMode, desired.CompletionMode) &&
-		reflect.DeepEqual(existing.BackoffLimitPerIndex, desired.BackoffLimitPerIndex) &&
-		reflect.DeepEqual(existing.MaxFailedIndexes, desired.MaxFailedIndexes) &&
-		reflect.DeepEqual(existing.BackoffLimit, desired.BackoffLimit) &&
-		reflect.DeepEqual(existing.TTLSecondsAfterFinished, desired.TTLSecondsAfterFinished) &&
-		containsLabels(existing.Template.Labels, desired.Template.Labels) &&
-		a.RestartPolicy == b.RestartPolicy &&
-		reflect.DeepEqual(a.AutomountServiceAccountToken, b.AutomountServiceAccountToken) &&
-		reflect.DeepEqual(a.EnableServiceLinks, b.EnableServiceLinks) &&
-		reflect.DeepEqual(a.SecurityContext, b.SecurityContext) &&
-		sameVolumes(a.Volumes, b.Volumes) &&
-		sameContainers(a.InitContainers, b.InitContainers) &&
-		sameContainers(a.Containers, b.Containers)
-}
-
-func sameContainers(existing, desired []corev1.Container) bool {
-	return slices.EqualFunc(existing, desired, func(a, b corev1.Container) bool {
-		return a.Name == b.Name && a.Image == b.Image &&
-			reflect.DeepEqual(a.Command, b.Command) && reflect.DeepEqual(a.Args, b.Args) && reflect.DeepEqual(a.Env, b.Env) &&
-			apiequality.Semantic.DeepEqual(a.Resources, b.Resources) &&
-			reflect.DeepEqual(a.VolumeMounts, b.VolumeMounts) && reflect.DeepEqual(a.SecurityContext, b.SecurityContext)
-	})
-}
-
-// sameVolumes compares volume sources without the defaulted projection mode.
-func sameVolumes(existing, desired []corev1.Volume) bool {
-	return slices.EqualFunc(existing, desired, func(a, b corev1.Volume) bool {
-		if a.Name != b.Name || !reflect.DeepEqual(a.EmptyDir, b.EmptyDir) || (a.Projected == nil) != (b.Projected == nil) {
-			return false
-		}
-		return a.Projected == nil || reflect.DeepEqual(a.Projected.Sources, b.Projected.Sources)
-	})
 }
 
 func sameOwner(owners []metav1.OwnerReference, desired metav1.OwnerReference) bool {
@@ -443,50 +389,29 @@ func containsLabels(existing, desired map[string]string) bool {
 	return true
 }
 
-// waitForTerminalJob watches the Job and re-reads it periodically, so a
-// dropped watch cannot hide the final state.
+// jobPollInterval is how often the controller checks a running round.
+var jobPollInterval = 30 * time.Second
+
+// waitForTerminalJob polls the Job until it finishes. Transient API errors are
+// logged and retried; a removed Job stops the controller.
 func waitForTerminalJob(ctx context.Context, client kubernetes.Interface, namespace, name string) (*batchv1.Job, error) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
+	var terminal *batchv1.Job
+	err := wait.PollUntilContextCancel(ctx, jobPollInterval, true, func(ctx context.Context) (bool, error) {
 		job, err := client.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("worker Job %s was removed while running", name)
+		}
 		if err != nil {
-			return nil, err
+			slog.Warn("Reading worker Job failed; retrying", "job", name, "error", err)
+			return false, nil
 		}
 		if jobTerminal(job) {
-			return job, nil
+			terminal = job
+			return true, nil
 		}
-		watcher, err := client.BatchV1().Jobs(namespace).Watch(ctx, metav1.ListOptions{
-			FieldSelector:   fields.OneTermEqualSelector("metadata.name", name).String(),
-			ResourceVersion: job.ResourceVersion,
-		})
-		if err != nil {
-			return nil, err
-		}
-		terminal, err := watchUntilResync(ctx, watcher, ticker.C, name)
-		watcher.Stop()
-		if err != nil || terminal != nil {
-			return terminal, err
-		}
-	}
-}
-
-func watchUntilResync(ctx context.Context, watcher watch.Interface, resync <-chan time.Time, name string) (*batchv1.Job, error) {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-resync:
-			return nil, nil
-		case event, open := <-watcher.ResultChan():
-			if !open || event.Type == watch.Error {
-				return nil, nil
-			}
-			if job, ok := event.Object.(*batchv1.Job); ok && job.Name == name && jobTerminal(job) {
-				return job, nil
-			}
-		}
-	}
+		return false, nil
+	})
+	return terminal, err
 }
 
 func jobTerminal(job *batchv1.Job) bool {

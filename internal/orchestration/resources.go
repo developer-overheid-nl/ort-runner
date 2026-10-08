@@ -3,10 +3,9 @@ package orchestration
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"path"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -21,8 +20,9 @@ import (
 const (
 	resourcePurposeLabel = "ort-runner.developer.overheid.nl/resource-purpose"
 	resourceDigestLabel  = "ort-runner.developer.overheid.nl/digest"
-	chunkIndexAnnotation = "ort-runner.developer.overheid.nl/chunk-index"
 	chunkCountAnnotation = "ort-runner.developer.overheid.nl/chunk-count"
+	rulesFile            = "evaluator.rules.kts"
+	specHashAnnotation   = "ort-runner.developer.overheid.nl/spec-hash"
 	manifestChunkKey     = "chunk.json"
 	rulesVolumeName      = "rules"
 	manifestVolumeName   = "manifest"
@@ -38,10 +38,10 @@ const (
 	// A Pod only fails on OOM, eviction or node loss; a repository is not retried
 	// within a round so that such failures use as little of the budget as possible.
 	retriesPerRepository = 0
-	// ORT gets half of the default 8Gi limit; Gradle, package managers and JVM native memory share the rest.
-	ortJavaOptions   = "-Xmx4g"
+	// ORT gets half of the container memory; Gradle, package managers and JVM
+	// native memory share the rest. It follows ORT_WORKER_MEMORY_LIMIT.
+	ortJavaOptions   = "-XX:MaxRAMPercentage=50"
 	gradleProperties = "org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m\norg.gradle.daemon=false\n"
-	finishedJobTTL   = 24 * 60 * 60
 	// uid and gid of the "ort" user in the ORT image. runAsNonRoot can only be
 	// verified with a numeric user, and the image declares the user by name.
 	ortUser = 1000
@@ -52,7 +52,7 @@ type WorkerResources struct {
 	Image           string
 	BatchID         string
 	RepositoryCount int
-	ConfigData      map[string][]byte
+	Rules           []byte // evaluator.rules.kts
 	ManifestChunks  []Chunk
 	// ResultEnvironment is passed only to the delivery container; see ResultEnvironment.
 	ResultEnvironment []corev1.EnvVar
@@ -143,16 +143,13 @@ func BuildConfigMaps(owner metav1.OwnerReference, namespace string, resources Wo
 		return nil, err
 	}
 	immutable := true
-	rulesData := map[string]string{"gradle.properties": gradleProperties}
-	for index, entry := range sortedConfigEntries(resources.ConfigData) {
-		rulesData[configMapKey(index)] = string(entry.data)
-	}
+	rulesData := map[string]string{rulesFile: string(resources.Rules), "gradle.properties": gradleProperties}
 	maps := []*corev1.ConfigMap{{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            rulesConfigMapName(owner),
 			Namespace:       namespace,
 			OwnerReferences: []metav1.OwnerReference{owner},
-			Labels:          resourceLabels("rules", digestConfigData(resources.ConfigData)),
+			Labels:          resourceLabels("rules", digest(resources.Rules)),
 		},
 		Immutable: &immutable,
 		Data:      rulesData,
@@ -165,7 +162,6 @@ func BuildConfigMaps(owner metav1.OwnerReference, namespace string, resources Wo
 				OwnerReferences: []metav1.OwnerReference{owner},
 				Labels:          resourceLabels("manifest", chunk.Digest),
 				Annotations: map[string]string{
-					chunkIndexAnnotation: fmt.Sprint(chunk.Index),
 					chunkCountAnnotation: fmt.Sprint(chunk.Count),
 				},
 			},
@@ -191,10 +187,6 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 		return nil, err
 	}
 
-	rulesItems := make([]corev1.KeyToPath, 0, len(resources.ConfigData))
-	for index, entry := range sortedConfigEntries(resources.ConfigData) {
-		rulesItems = append(rulesItems, corev1.KeyToPath{Key: configMapKey(index), Path: entry.path})
-	}
 	manifestSources := make([]corev1.VolumeProjection, 0, len(resources.ManifestChunks))
 	for _, chunk := range resources.ManifestChunks {
 		manifestSources = append(manifestSources, configMapProjection(manifestConfigMapName(owner, resources.Round, chunk.Index),
@@ -244,17 +236,15 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 	completionMode := batchv1.IndexedCompletion
 	retries := int32(retriesPerRepository)
 	deadline := int64(resources.RoundDeadline / time.Second)
-	ttl := int32(finishedJobTTL)
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, OwnerReferences: []metav1.OwnerReference{owner}, Labels: labels},
 		Spec: batchv1.JobSpec{
-			Completions:             &completions,
-			Parallelism:             &parallelism,
-			CompletionMode:          &completionMode,
-			BackoffLimit:            ptr.To(int32(jobBackoffLimit)),
-			BackoffLimitPerIndex:    &retries,
-			ActiveDeadlineSeconds:   &deadline,
-			TTLSecondsAfterFinished: &ttl,
+			Completions:           &completions,
+			Parallelism:           &parallelism,
+			CompletionMode:        &completionMode,
+			BackoffLimit:          ptr.To(int32(jobBackoffLimit)),
+			BackoffLimitPerIndex:  &retries,
+			ActiveDeadlineSeconds: &deadline,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
@@ -271,7 +261,7 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 					InitContainers: []corev1.Container{scan},
 					Containers:     []corev1.Container{deliver},
 					Volumes: []corev1.Volume{
-						projectedVolume(rulesVolumeName, configMapProjection(rulesConfigMapName(owner), rulesItems...)),
+						projectedVolume(rulesVolumeName, configMapProjection(rulesConfigMapName(owner), corev1.KeyToPath{Key: rulesFile, Path: rulesFile})),
 						projectedVolume(manifestVolumeName, manifestSources...),
 						projectedVolume(gradleVolumeName, configMapProjection(rulesConfigMapName(owner), corev1.KeyToPath{Key: "gradle.properties", Path: "gradle.properties"})),
 						{Name: outputVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
@@ -279,7 +269,9 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 				},
 			},
 		},
-	}, nil
+	}
+	job.Annotations = map[string]string{specHashAnnotation: jobSpecHash(job.Spec)}
+	return job, nil
 }
 
 func validateResources(owner metav1.OwnerReference, namespace string, resources WorkerResources) error {
@@ -298,13 +290,8 @@ func validateResources(owner metav1.OwnerReference, namespace string, resources 
 	if resources.Round < 0 || resources.RoundDeadline < time.Second {
 		return fmt.Errorf("round must not be negative and needs at least one second until the batch deadline")
 	}
-	if len(resources.ConfigData["evaluator.rules.kts"]) == 0 {
-		return fmt.Errorf("evaluator.rules.kts is required")
-	}
-	for file := range resources.ConfigData {
-		if file == "" || path.IsAbs(file) || path.Clean(file) != file || file == ".." || strings.HasPrefix(file, "../") {
-			return fmt.Errorf("unsafe config path %q", file)
-		}
+	if len(resources.Rules) == 0 {
+		return fmt.Errorf("%s is required", rulesFile)
 	}
 	return resources.Settings.Validate()
 }
@@ -323,26 +310,6 @@ func configMapProjection(name string, items ...corev1.KeyToPath) corev1.VolumePr
 func projectedVolume(name string, sources ...corev1.VolumeProjection) corev1.Volume {
 	return corev1.Volume{Name: name, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: sources}}}
 }
-
-type configEntry struct {
-	path string
-	data []byte
-}
-
-func sortedConfigEntries(data map[string][]byte) []configEntry {
-	paths := make([]string, 0, len(data))
-	for file := range data {
-		paths = append(paths, file)
-	}
-	sort.Strings(paths)
-	entries := make([]configEntry, 0, len(paths))
-	for _, file := range paths {
-		entries = append(entries, configEntry{path: file, data: data[file]})
-	}
-	return entries
-}
-
-func configMapKey(index int) string { return fmt.Sprintf("file-%04d", index) }
 
 const (
 	dnsLabelLength = 63
@@ -389,17 +356,6 @@ func resourceLabels(purpose, digest string) map[string]string {
 	}
 }
 
-func digestConfigData(data map[string][]byte) string {
-	hash := sha256.New()
-	for _, entry := range sortedConfigEntries(data) {
-		hash.Write([]byte(entry.path))
-		hash.Write([]byte{0})
-		hash.Write(entry.data)
-		hash.Write([]byte{0})
-	}
-	return hex.EncodeToString(hash.Sum(nil))
-}
-
 func safeLabel(value string) string {
 	value = strings.Trim(value, "-_.")
 	if len(value) <= 63 {
@@ -407,4 +363,18 @@ func safeLabel(value string) string {
 	}
 	sum := sha256.Sum256([]byte(value))
 	return strings.Trim(value[:52], "-_.") + "-" + hex.EncodeToString(sum[:])[:10]
+}
+
+// jobSpecHash identifies the Job spec this package built, so a restarted
+// controller can recognise its own Job without comparing fields the API
+// server or an admission policy may default. The deadline is left out: a
+// restart computes the time left in the batch anew.
+func jobSpecHash(spec batchv1.JobSpec) string {
+	spec = *spec.DeepCopy()
+	spec.ActiveDeadlineSeconds = nil
+	data, err := json.Marshal(spec)
+	if err != nil {
+		panic(fmt.Sprintf("marshal Job spec: %v", err))
+	}
+	return digest(data)
 }

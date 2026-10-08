@@ -47,6 +47,11 @@ func runCommand(ctx context.Context, name string, args []string, dir string, env
 	}
 	cmd.WaitDelay = 5 * time.Second
 	err = cmd.Run()
+	if cmd.Process != nil {
+		// Stop what the command left behind, such as a Gradle daemon. The
+		// command itself has exited, so this only affects its background processes.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	if ctx.Err() != nil {
 		return -1, fmt.Errorf("%s: %w", name, ctx.Err())
 	}

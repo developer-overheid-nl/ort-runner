@@ -2,7 +2,6 @@ package orchestration
 
 import (
 	"fmt"
-	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -66,8 +65,13 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 	if *spec.BackoffLimit != 10 || *spec.BackoffLimitPerIndex != 0 || spec.MaxFailedIndexes != nil {
 		t.Fatalf("incorrect retry settings: backoff=%v maxFailed=%v", spec.BackoffLimitPerIndex, spec.MaxFailedIndexes)
 	}
-	if *spec.ActiveDeadlineSeconds != int64(46*time.Hour/time.Second) || *spec.TTLSecondsAfterFinished != 86400 {
-		t.Fatalf("deadline=%v ttl=%v", *spec.ActiveDeadlineSeconds, *spec.TTLSecondsAfterFinished)
+	if *spec.ActiveDeadlineSeconds != int64(46*time.Hour/time.Second) {
+		t.Fatalf("deadline=%v", *spec.ActiveDeadlineSeconds)
+	}
+	// Worker Jobs must outlive the batch: the controller Job owns them and its
+	// own TTL removes them. A shorter TTL would let a restart rerun a round.
+	if spec.TTLSecondsAfterFinished != nil {
+		t.Fatalf("worker Job has its own TTL of %d seconds", *spec.TTLSecondsAfterFinished)
 	}
 	pod := spec.Template.Spec
 	if pod.RestartPolicy != corev1.RestartPolicyNever || *pod.AutomountServiceAccountToken || *pod.EnableServiceLinks {
@@ -92,7 +96,7 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 		t.Fatalf("scan resources=%+v", scan.Resources)
 	}
 	scanEnv := environment(scan)
-	if scanEnv["ORT_OPTS"].Value != "-Xmx4g" || scanEnv["ORT_MANIFEST_DIR"].Value != "/manifest" || scanEnv["ORT_REPOSITORY_TIMEOUT"].Value != "10m0s" {
+	if scanEnv["ORT_OPTS"].Value != "-XX:MaxRAMPercentage=50" || scanEnv["ORT_MANIFEST_DIR"].Value != "/manifest" || scanEnv["ORT_REPOSITORY_TIMEOUT"].Value != "10m0s" {
 		t.Fatalf("scan environment=%+v", scanEnv)
 	}
 	for _, name := range append([]string{register.APIKeyVariable, register.ResultsURLVariable}, register.ResultCredentialVariables...) {
@@ -155,12 +159,11 @@ func TestBuildResourcesRejectsInvalidConfiguration(t *testing.T) {
 		{name: "deadline", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.Deadline = 0 }},
 		{name: "round deadline", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.RoundDeadline = 0 }},
 		{name: "repository timeout", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.RepositoryTimeout = 0 }},
-		{name: "rules", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { delete(r.ConfigData, "evaluator.rules.kts") }},
+		{name: "rules", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Rules = nil }},
 		{name: "quantity", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.MemoryLimit = "many" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resources := valid
-			resources.ConfigData = maps.Clone(valid.ConfigData)
 			if tc.mutate != nil {
 				tc.mutate(&resources)
 			}
@@ -201,7 +204,7 @@ func testWorkerResources(t *testing.T) WorkerResources {
 		Image:           "ghcr.io/example/ort-runner@sha256:1234",
 		BatchID:         "batch-1",
 		RepositoryCount: 2,
-		ConfigData:      map[string][]byte{"evaluator.rules.kts": []byte("licenseRule {}")},
+		Rules:           []byte("licenseRule {}"),
 		ManifestChunks:  chunks,
 		ResultEnvironment: ResultEnvironment([]corev1.EnvVar{
 			{Name: "ORT_RESULTS_URL", Value: "https://example.test/results"},
@@ -232,5 +235,30 @@ func TestWorkerJobNameLeavesRoomForPodHostnames(t *testing.T) {
 	}
 	if workerJobName(owner, 0) == workerJobName(testOwner(), 0) {
 		t.Fatal("worker Job names are not unique per controller")
+	}
+}
+
+func TestJobSpecHashIgnoresDeadlineOnly(t *testing.T) {
+	resources := testWorkerResources(t)
+	build := func(mutate func(*WorkerResources)) string {
+		t.Helper()
+		changed := resources
+		mutate(&changed)
+		job, err := BuildIndexedJob(testOwner(), "oss", "scan-batch", changed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return job.Annotations[specHashAnnotation]
+	}
+	original := build(func(*WorkerResources) {})
+	if original == "" {
+		t.Fatal("worker Job has no spec hash")
+	}
+	// A restarted controller computes a shorter deadline for the same round.
+	if build(func(r *WorkerResources) { r.RoundDeadline = time.Hour }) != original {
+		t.Fatal("deadline changed the spec hash")
+	}
+	if build(func(r *WorkerResources) { r.Image = "other" }) == original {
+		t.Fatal("image did not change the spec hash")
 	}
 }

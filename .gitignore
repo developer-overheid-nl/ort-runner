@@ -36,3 +36,9 @@ go.work.sum
 /bin/
 /output/
 /.test-config/
+
+# macOS and stray local Node tooling
+.DS_Store
+node_modules/
+package.json
+package-lock.json

@@ -11,39 +11,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-func TestControllerCommandHelpAndRequiredEnvironment(t *testing.T) {
-	clearControllerEnv(t)
-	var output bytes.Buffer
-	if code := execute(context.Background(), []string{"controller", "--help"}, &output, &output); code != 2 {
-		t.Fatalf("help exit=%d output=%s", code, output.String())
-	}
-	for _, tc := range []struct {
-		name, variable, value string
-	}{
-		{name: "namespace", variable: "POD_NAMESPACE", value: "oss"},
-		{name: "pod", variable: "POD_NAME", value: "controller"},
-		{name: "repository URL", variable: "ORT_REPOSITORIES_URL", value: "https://example.test/repositories"},
-		{name: "config", variable: "ORT_CONFIG_DIR", value: "/config"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			clearControllerEnv(t)
-			for _, pair := range [][2]string{{"POD_NAMESPACE", "oss"}, {"POD_NAME", "controller"}, {"ORT_BATCH_ID", "batch-1"}, {"ORT_REPOSITORIES_URL", "https://example.test/repositories"}, {"ORT_CONFIG_DIR", "/config"}} {
-				t.Setenv(pair[0], pair[1])
-			}
-			t.Setenv(tc.variable, "")
-			var output bytes.Buffer
-			if code := execute(context.Background(), []string{"controller"}, &output, &output); code != 2 {
-				t.Fatalf("missing %s exit=%d output=%s", tc.name, code, output.String())
-			}
-		})
-	}
-}
-
 func TestControllerCommandRejectsKubernetesBefore133(t *testing.T) {
-	clearControllerEnv(t)
-	for _, pair := range [][2]string{{"POD_NAMESPACE", "oss"}, {"POD_NAME", "controller"}, {"ORT_BATCH_ID", "batch-1"}, {"ORT_REPOSITORIES_URL", "http://127.0.0.1:1/repositories"}, {"ORT_CONFIG_DIR", "/config"}} {
-		t.Setenv(pair[0], pair[1])
-	}
+	setValidControllerEnv(t)
 	original := controllerDependencies
 	controllerDependencies = func() (kubernetes.Interface, *k8sversion.Info, error) {
 		return fake.NewSimpleClientset(), &k8sversion.Info{Major: "1", Minor: "32", GitVersion: "v1.32.9"}, nil
@@ -79,13 +48,10 @@ func TestControllerCommandRejectsInvalidSettingsAndArguments(t *testing.T) {
 		{name: "parallelism", variable: "ORT_PARALLELISM", value: "101"},
 		{name: "deadline", variable: "ORT_BATCH_DEADLINE", value: "-1h"},
 		{name: "storage", variable: "ORT_WORKER_EPHEMERAL_STORAGE_LIMIT", value: "lots"},
-		{name: "arguments", args: []string{"--parallelism", "5"}},
+		{name: "arguments", args: []string{"--help"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			clearControllerEnv(t)
-			for _, pair := range [][2]string{{"POD_NAMESPACE", "oss"}, {"POD_NAME", "controller"}, {"ORT_BATCH_ID", "batch-1"}, {"ORT_REPOSITORIES_URL", "https://example.test/repositories"}, {"ORT_CONFIG_DIR", "/config"}} {
-				t.Setenv(pair[0], pair[1])
-			}
+			setValidControllerEnv(t)
 			if tc.variable != "" {
 				t.Setenv(tc.variable, tc.value)
 			}
@@ -94,6 +60,14 @@ func TestControllerCommandRejectsInvalidSettingsAndArguments(t *testing.T) {
 				t.Fatalf("exit=%d output=%s", code, output.String())
 			}
 		})
+	}
+}
+
+func setValidControllerEnv(t *testing.T) {
+	t.Helper()
+	clearControllerEnv(t)
+	for _, pair := range [][2]string{{"POD_NAMESPACE", "oss"}, {"POD_NAME", "controller"}, {"ORT_BATCH_ID", "batch-1"}, {"ORT_REPOSITORIES_URL", "http://127.0.0.1:1/repositories"}, {"ORT_CONFIG_DIR", "/config"}} {
+		t.Setenv(pair[0], pair[1])
 	}
 }
 

@@ -149,8 +149,8 @@ Een worker-Pod heeft twee stappen:
    dat maximaal vijf keer. Alleen deze stap krijgt de OAuth-gegevens.
 
 De scan vraagt standaard `200m` CPU, `4Gi` geheugen en `10Gi` tijdelijke opslag
-aan, met limieten van `2000m`, `8Gi` en `30Gi`. Binnen die grens krijgt ORT
-maximaal `4Gi` Java-heap. De gemounte Gradle-config begrenst Gradle op `2Gi` heap
+aan, met limieten van `2000m`, `8Gi` en `30Gi`. ORT krijgt de helft van het
+geheugen als Java-heap (`-XX:MaxRAMPercentage=50`), bij `8Gi` dus `4Gi`. De gemounte Gradle-config begrenst Gradle op `2Gi` heap
 en `512Mi` metaspace, ook als een gescande repository hogere waarden bevat. Een
 Pod die zijn geheugen- of opslaglimiet overschrijdt, raakt alleen zijn eigen
 repository.
@@ -165,11 +165,14 @@ repository wordt niet opnieuw geprobeerd binnen dezelfde ronde
 (`backoffLimitPerIndex: 0`). Een worker-Job stopt na meer dan 10 mislukte Pods:
 `backoffLimit: 10`, het maximum dat de tenant-policy van het cluster toestaat.
 De controller start dan een nieuwe ronde met alleen de repositories die nog niet
-klaar waren. Dat gebeurt tot alles klaar is, een ronde niets oplevert, er 20
-rondes zijn geweest of `ORT_BATCH_DEADLINE` is verstreken. Repositories die dan
-niet zijn afgerond, gelden als mislukt en worden bij een ingesteld
-resultaatendpoint als mislukt gemeld. Afgeronde worker Jobs en hun
-Pods worden na 24 uur opgeruimd.
+klaar waren. Dat gebeurt tot alles klaar is, een ronde niets oplevert of
+`ORT_BATCH_DEADLINE` is verstreken. Repositories die dan niet zijn afgerond, gelden
+als mislukt en worden bij een ingesteld resultaatendpoint als mislukt gemeld.
+
+Worker-Jobs horen bij de controller-Job en worden samen met die Job opgeruimd.
+Een herstarte controller maakt een afgeronde ronde nooit opnieuw aan; ontbreekt
+de Job van zo'n ronde, dan stopt hij met een foutmelding. Tijdelijke API-fouten
+tijdens het wachten logt hij en probeert hij opnieuw.
 
 ```sh
 kubectl -n tn-don-oss-test get job <worker-job> \
@@ -303,21 +306,26 @@ De GitHub-workflow voert Go-tests en deze containertest uit. Met **Run workflow*
 kun je een kandidaat-image en config-revisie opgeven. Gewone pushes en pull requests
 publiceren geen image.
 
-## Releasen
+## Releasen en deployen
 
-Een semver-tag met de vorm `v*.*.*` start na de tests de publicatie van het
-multi-platform runner-image en maakt een GitHub Release:
+Er zijn drie workflows:
 
-```text
-ghcr.io/developer-overheid-nl/ort-runner:v0.0.2
-ghcr.io/developer-overheid-nl/ort-runner:<commit-sha>
-```
+| Workflow | Start bij | Doet |
+| --- | --- | --- |
+| `test.yml` | push naar `main` of `develop`, pull request, tag `v*.*.*` | Go-tests en de ORT-containertest; bij een tag daarna het multi-platform image `:<tag>` en `:<commit-sha>` publiceren en een GitHub Release maken |
+| `deploy-test.yml` | push met `[deploy-test]` in de commitmelding, of handmatig | image `:test` en `:<commit-sha>` publiceren en de test-overlay in `don-infra` bijwerken |
+| `deploy-prod.yml` | push naar `main`, of handmatig | na de Go-tests image `:latest` en `:<commit-sha>` publiceren en een release-PR in `don-infra` openen |
 
-Maak een release vanaf de gewenste commit met:
+De stappen die `don-infra` bijwerken, draaien in de GitHub Environments `test` en
+`production`. Zet de secrets `RELEASE_PROCES_APP_ID` en
+`RELEASE_PROCES_APP_PRIVATE_KEY` daar, niet op repository-niveau, en beperk per
+environment welke branches mogen deployen.
+
+Een versie-release maak je met:
 
 ```sh
-git tag v0.0.2
-git push origin v0.0.2
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Ontwikkelen

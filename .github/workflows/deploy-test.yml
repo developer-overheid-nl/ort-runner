@@ -76,6 +76,9 @@ jobs:
     name: Update test deployment
     needs: build-and-push
     runs-on: ubuntu-latest
+    # The release app key is an environment secret; the environment limits
+    # which branches may deploy to test.
+    environment: test
     steps:
       - name: Validate infra configuration
         id: infra-repo

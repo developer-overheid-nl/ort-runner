@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -351,5 +353,31 @@ func TestRegisterCredentialsDoNotReachScannedProcesses(t *testing.T) {
 	write(t, cfg.ORTBinary, strings.Replace(string(script), "set -eu", guard, 1))
 	if _, err := Run(context.Background(), cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunCommandStopsBackgroundProcesses(t *testing.T) {
+	// ORT can leave a Gradle daemon behind; in local batch mode those would pile up.
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	code, err := runCommand(context.Background(), "sh", []string{"-c", "sleep 60 & echo $! > " + pidFile}, dir, nil, filepath.Join(dir, "log"))
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("background process %d still runs after the command finished", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

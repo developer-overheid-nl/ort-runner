@@ -21,8 +21,22 @@ env:
   DEPLOY_ENV: prod
 
 jobs:
+  test:
+    name: Test before release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./cmd/... ./internal/...
+      - run: go vet ./cmd/... ./internal/...
+
   build-and-push:
     name: Build and push production image
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -54,6 +68,8 @@ jobs:
     name: Create production deployment PR
     needs: build-and-push
     runs-on: ubuntu-latest
+    # The release app key is an environment secret, available to main only.
+    environment: production
     steps:
       - name: Validate infra configuration
         id: infra-repo

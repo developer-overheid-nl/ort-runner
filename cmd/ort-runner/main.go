@@ -22,10 +22,6 @@ var version = "dev"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-	if err := loadLocalEnv(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	os.Exit(execute(ctx, os.Args[1:], os.Stdout, os.Stderr))
@@ -47,6 +43,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 }
 
 func executeLocal(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	// Kubernetes Pods get their configuration from the Pod spec; .env.local is
+	// only for runs on a developer machine.
+	if err := loadLocalEnv(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	flags := flag.NewFlagSet("ort-runner", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	cfg := runner.Config{RunnerVersion: version, ORTImage: os.Getenv("ORT_RUNNER_ORT_IMAGE")}

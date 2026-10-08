@@ -6,45 +6,38 @@ import (
 	"testing"
 )
 
-func TestWorkerCommandHelpAndRequiredEnvironment(t *testing.T) {
-	clearWorkerEnv(t)
-	var output bytes.Buffer
-	if code := execute(context.Background(), []string{"worker", "--help"}, &output, &output); code != 2 {
-		t.Fatalf("help exit=%d output=%s", code, output.String())
-	}
+func TestWorkerCommandRejectsInvalidEnvironmentAndArguments(t *testing.T) {
 	for _, tc := range []struct {
-		name, variable string
+		name, variable, value string
+		args                  []string
 	}{
 		{name: "batch", variable: "ORT_BATCH_ID"},
 		{name: "manifest", variable: "ORT_MANIFEST_DIR"},
-		{name: "index", variable: "JOB_COMPLETION_INDEX"},
+		{name: "missing index", variable: "JOB_COMPLETION_INDEX"},
+		{name: "malformed index", variable: "JOB_COMPLETION_INDEX", value: "invalid"},
+		{name: "arguments", args: []string{"--help"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clearWorkerEnv(t)
 			t.Setenv("ORT_BATCH_ID", "batch-1")
 			t.Setenv("ORT_MANIFEST_DIR", "/manifest")
 			t.Setenv("JOB_COMPLETION_INDEX", "0")
-			t.Setenv(tc.variable, "")
+			if tc.variable != "" {
+				t.Setenv(tc.variable, tc.value)
+			}
 			var output bytes.Buffer
-			if code := execute(context.Background(), []string{"worker"}, &output, &output); code != 2 {
-				t.Fatalf("missing %s exit=%d output=%s", tc.name, code, output.String())
+			if code := execute(context.Background(), append([]string{"worker"}, tc.args...), &output, &output); code != 2 {
+				t.Fatalf("exit=%d output=%s", code, output.String())
 			}
 		})
 	}
-	clearWorkerEnv(t)
-	t.Setenv("ORT_BATCH_ID", "batch-1")
-	t.Setenv("ORT_MANIFEST_DIR", "/manifest")
-	t.Setenv("JOB_COMPLETION_INDEX", "invalid")
-	if code := execute(context.Background(), []string{"worker"}, &output, &output); code != 2 {
-		t.Fatalf("malformed index accepted: exit=%d", code)
-	}
 }
 
-func TestDeliverCommandRequiresBatchAndSubmission(t *testing.T) {
+func TestDeliverCommandRejectsInvalidInput(t *testing.T) {
 	clearWorkerEnv(t)
 	var output bytes.Buffer
 	if code := execute(context.Background(), []string{"deliver", "--help"}, &output, &output); code != 2 {
-		t.Fatalf("help exit=%d", code)
+		t.Fatalf("arguments accepted: exit=%d", code)
 	}
 	if code := execute(context.Background(), []string{"deliver"}, &output, &output); code != 2 {
 		t.Fatalf("missing batch accepted: exit=%d", code)
