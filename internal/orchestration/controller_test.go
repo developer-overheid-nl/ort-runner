@@ -281,8 +281,8 @@ func TestRunControllerResumesLaterRoundAfterRestart(t *testing.T) {
 	client := fake.NewSimpleClientset(controllerPod())
 	cfg := controllerConfig(t, server.URL)
 	// First attempt: round 0 hits the limit, then the controller is stopped
-	// while round 1 is running.
-	finishJobs(t, client, jobResult{completed: "0", reason: batchv1.JobReasonBackoffLimitExceeded})
+	// while round 1 is running. The reactor is registered before finishJobs
+	// starts using the client.
 	ctx, cancel := context.WithCancel(context.Background())
 	client.PrependReactor("create", "jobs", func(action ktesting.Action) (bool, runtime.Object, error) {
 		if strings.Contains(action.(ktesting.CreateAction).GetObject().(*batchv1.Job).Name, "r1-workers") {
@@ -290,6 +290,7 @@ func TestRunControllerResumesLaterRoundAfterRestart(t *testing.T) {
 		}
 		return false, nil, nil
 	})
+	finishJobs(t, client, jobResult{completed: "0", reason: batchv1.JobReasonBackoffLimitExceeded})
 	if _, err := RunController(ctx, client, cfg); !errors.Is(err, context.Canceled) {
 		t.Fatalf("first attempt: %v", err)
 	}
