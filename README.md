@@ -316,11 +316,6 @@ Er zijn drie workflows:
 | `deploy-test.yml` | push met `[deploy-test]` in de commitmelding, of handmatig | image `:test` en `:<commit-sha>` publiceren en de test-overlay in `don-infra` bijwerken |
 | `deploy-prod.yml` | push naar `main`, of handmatig | na de Go-tests image `:latest` en `:<commit-sha>` publiceren en een release-PR in `don-infra` openen |
 
-De stappen die `don-infra` bijwerken, draaien in de GitHub Environments `test` en
-`production`. Zet de secrets `RELEASE_PROCES_APP_ID` en
-`RELEASE_PROCES_APP_PRIVATE_KEY` daar, niet op repository-niveau, en beperk per
-environment welke branches mogen deployen.
-
 Een versie-release maak je met:
 
 ```sh

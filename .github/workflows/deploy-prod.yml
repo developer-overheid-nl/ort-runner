@@ -68,8 +68,6 @@ jobs:
     name: Create production deployment PR
     needs: build-and-push
     runs-on: ubuntu-latest
-    # The release app key is an environment secret, available to main only.
-    environment: production
     steps:
       - name: Validate infra configuration
         id: infra-repo
