@@ -21,7 +21,12 @@ import (
 const localEnvFile = ".env.local"
 
 func loadLocalEnv() error {
-	if err := godotenv.Load(localEnvFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// No file, or a working directory this user may not read (such as the
+	// image home directory under another uid): there is nothing to load.
+	if _, err := os.Stat(localEnvFile); err != nil {
+		return nil
+	}
+	if err := godotenv.Load(localEnvFile); err != nil {
 		return fmt.Errorf("load %s: %w", localEnvFile, err)
 	}
 	return nil
