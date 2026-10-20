@@ -1,0 +1,34 @@
+name: Nieuwe feature
+description: Ik heb een idee voor een nieuwe feature of verbetering
+title: "[Enhancement]: "
+labels: [enhancement]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Bedankt voor het aandragen van een nieuwe feature. Beschrijf zo duidelijk mogelijk je idee of verbetering.
+        Controleer eerst of iemand al een soortgelijk issue heeft ingediend in de [backlog](https://github.com/developer-overheid-nl/ort-runner/issues).
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Omschrijving
+      description: Beschrijf de feature of verbetering en voeg relevante voorbeelden of links toe.
+    validations:
+      required: true
+
+  - type: textarea
+    id: remarks
+    attributes:
+      label: Opmerkingen
+      description: Voeg hier eventuele aanvullende opmerkingen toe.
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        Alvast bedankt voor je bijdrage.
+
+        Het team van Developer Overheid NL
