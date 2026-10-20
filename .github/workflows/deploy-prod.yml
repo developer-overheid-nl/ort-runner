@@ -124,8 +124,10 @@ jobs:
             exit 1
           fi
           if ! yq e '.images[] | select(.newName == strenv(IMAGE_NAME)) | .newName' "$KUSTOMIZATION_FILE" | grep -Fxq "$IMAGE_NAME"; then
-            echo "Image $IMAGE_NAME staat niet in $KUSTOMIZATION_FILE." >&2
-            exit 1
+            # The runner is not deployed to production yet; publishing the
+            # image is enough until the prod overlay lists it.
+            echo "::warning::$IMAGE_NAME staat niet in $KUSTOMIZATION_FILE; er wordt geen release-PR gemaakt."
+            exit 0
           fi
 
           yq e '(.images[] | select(.newName == strenv(IMAGE_NAME))).newTag = strenv(GITHUB_SHA)' \
