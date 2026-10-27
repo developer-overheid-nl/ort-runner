@@ -181,7 +181,7 @@ func TestRunChecksOutRequestedCommitAndKeepsFindings(t *testing.T) {
 	if err := json.Unmarshal(data, &saved); err != nil {
 		t.Fatal(err)
 	}
-	if saved.Status != "completed" || saved.FinishedAt == nil {
+	if saved.Status != "completed" || saved.FinishedAt == nil || saved.Dependencies == nil {
 		t.Fatalf("incomplete saved report: %+v", saved)
 	}
 	if saved.ConfigDigest == "" {

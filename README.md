@@ -260,7 +260,12 @@ run-123456/
 ```
 
 `run.json` bevat de commit, config-vingerafdruk, image, ORT-versies, tijden, status
-en exitcode per stap, de OSV-kwetsbaarheden en de regelovertredingen. Per kwetsbaarheid
+en exitcode per stap, een dependency-overzicht, de OSV-kwetsbaarheden en de
+regelovertredingen. Het dependency-overzicht (`dependencies`) bevat per gevonden
+projectbestand de package manager en het aantal directe en transitieve dependencies,
+plus de totalen over de hele repository. In de totalen telt elk package één keer:
+een package dat in het ene project direct en in het andere transitief is, telt als
+direct. Per kwetsbaarheid
 worden het package, advisory-id, samenvatting, beschikbare score en eerste opgeloste
 versies opgenomen. Bij een fout blijven reeds gemaakte resultaten en logs bewaard.
 De tijdelijke broncode en config-kopie worden opgeruimd.

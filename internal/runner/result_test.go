@@ -3,6 +3,7 @@ package runner
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -140,5 +141,43 @@ func TestResultSeparatesFindingsFromExecutionFailures(t *testing.T) {
 func TestMissingArtifactFails(t *testing.T) {
 	if _, err := readResult(filepath.Join(t.TempDir(), "missing.yml"), "analyze", 0); err == nil {
 		t.Fatal("missing result file was accepted")
+	}
+}
+
+func TestAnalyzerDependenciesAreCountedPerProject(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "analyzer-result.yml")
+	data := `analyzer:
+  environment: {ort_version: 92.4.0}
+  result:
+    projects:
+    - {id: "GoMod::example.org/app:abc", definition_file_path: go.mod}
+    - {id: "GoMod::example.org/app/tools:abc", definition_file_path: tools/go.mod}
+    - {id: "NPM::web:1.0.0", definition_file_path: web/package.json}
+    packages: [{id: "Go::a:1"}, {id: "Go::b:1"}, {id: "Go::c:1"}, {id: "Go::d:1"}]
+    dependency_graphs:
+      GoMod:
+        packages: ["Go::a:1", "Go::b:1", "Go::c:1", "Go::d:1"]
+        scopes:
+          ":example.org/app:abc:main": [{root: 0}]
+          ":example.org/app:abc:test": [{root: 1}]
+          ":example.org/app/tools:abc:main": [{root: 2}, {root: 1, fragment: 1}]
+        nodes: [{}, {pkg: 1}, {pkg: 2}, {pkg: 3}, {pkg: 1, fragment: 1}]
+        edges: [{from: 0, to: 2}, {from: 2, to: 3}, {from: 3, to: 2}, {from: 4, to: 3}]
+`
+	if err := os.WriteFile(file, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readResult(file, "analyze", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Dependencies{DirectCount: 3, TransitiveCount: 1, Projects: []DependencyProject{
+		{PackageManager: "GoMod", DefinitionFile: "go.mod", DirectCount: 2, TransitiveCount: 2},
+		{PackageManager: "GoMod", DefinitionFile: "tools/go.mod", DirectCount: 2, TransitiveCount: 1},
+		{PackageManager: "NPM", DefinitionFile: "web/package.json", DirectCount: 0, TransitiveCount: 0},
+	}}
+	if !reflect.DeepEqual(got.Dependencies, want) {
+		t.Fatalf("dependencies = %#v, want %#v", got.Dependencies, want)
 	}
 }

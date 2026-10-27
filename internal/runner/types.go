@@ -38,9 +38,25 @@ type Report struct {
 	StartedAt       time.Time       `json:"started_at"`
 	FinishedAt      *time.Time      `json:"finished_at,omitempty"`
 	PackageCount    *int            `json:"package_count,omitempty"`
+	Dependencies    *Dependencies   `json:"dependencies,omitempty"`
 	Stages          []Stage         `json:"stages"`
 	Findings        []Finding       `json:"findings"`
 	Vulnerabilities []Vulnerability `json:"vulnerabilities"`
+}
+
+// Dependencies counts unique packages. A package that is direct in one project and
+// transitive in another counts as direct in the totals.
+type Dependencies struct {
+	DirectCount     int                 `json:"direct_count"`
+	TransitiveCount int                 `json:"transitive_count"`
+	Projects        []DependencyProject `json:"projects"`
+}
+
+type DependencyProject struct {
+	PackageManager  string `json:"package_manager"`
+	DefinitionFile  string `json:"definition_file"`
+	DirectCount     int    `json:"direct_count"`
+	TransitiveCount int    `json:"transitive_count"`
 }
 
 type Finding struct {

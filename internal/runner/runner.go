@@ -147,7 +147,7 @@ func Run(ctx context.Context, cfg Config) (report Report, runErr error) {
 			return report, fmt.Errorf("%s failed: %w", stage.Name, err)
 		}
 		if stage.Name == "analyze" {
-			report.PackageCount = &info.Packages
+			report.PackageCount, report.Dependencies = &info.Packages, &info.Dependencies
 		}
 		if stage.Name == "advise" {
 			report.Vulnerabilities = append(report.Vulnerabilities, info.Vulnerabilities...)
