@@ -41,6 +41,7 @@ type Report struct {
 	Dependencies    *Dependencies   `json:"dependencies,omitempty"`
 	Stages          []Stage         `json:"stages"`
 	Findings        []Finding       `json:"findings"`
+	Rules           []RuleResult    `json:"rules,omitempty"`
 	Vulnerabilities []Vulnerability `json:"vulnerabilities"`
 }
 
@@ -57,6 +58,15 @@ type DependencyProject struct {
 	DefinitionFile  string `json:"definition_file"`
 	DirectCount     int    `json:"direct_count"`
 	TransitiveCount int    `json:"transitive_count"`
+}
+
+// RuleResult reports every rule from the configuration's rules.yml, so passed
+// rules are visible too; ORT itself only reports violations.
+type RuleResult struct {
+	Rule     string `json:"rule"`
+	Severity string `json:"severity"`
+	Scope    string `json:"scope"`
+	Passed   bool   `json:"passed"`
 }
 
 type Finding struct {

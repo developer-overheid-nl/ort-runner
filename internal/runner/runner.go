@@ -89,7 +89,8 @@ func Run(ctx context.Context, cfg Config) (report Report, runErr error) {
 		}
 	}()
 	config := filepath.Join(work, "config")
-	report.ConfigDigest, err = snapshotConfig(cfg.ConfigDir, config)
+	var rules []ruleDefinition
+	report.ConfigDigest, rules, err = snapshotConfig(cfg.ConfigDir, config)
 	if err != nil {
 		return report, fmt.Errorf("prepare configuration: %w", err)
 	}
@@ -154,6 +155,7 @@ func Run(ctx context.Context, cfg Config) (report Report, runErr error) {
 		}
 		if stage.Name == "evaluate" {
 			report.Findings = append(report.Findings, info.Findings...)
+			report.Rules = ruleResults(rules, report.Findings)
 		}
 		if err := saveReport(report); err != nil {
 			return report, err

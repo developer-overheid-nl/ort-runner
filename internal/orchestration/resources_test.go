@@ -262,3 +262,31 @@ func TestJobSpecHashIgnoresDeadlineOnly(t *testing.T) {
 		t.Fatal("image did not change the spec hash")
 	}
 }
+
+func TestRulesManifestIsMountedOnlyWhenPresent(t *testing.T) {
+	for _, manifest := range []string{"", "rules: []\n"} {
+		resources := testWorkerResources(t)
+		resources.RulesManifest = []byte(manifest)
+		maps, err := BuildConfigMaps(testOwner(), "oss", resources)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value, stored := maps[0].Data[rulesManifestFile]
+		job, err := BuildIndexedJob(testOwner(), "oss", "scan-batch", resources)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mounted := false
+		for _, volume := range job.Spec.Template.Spec.Volumes {
+			if volume.Name != rulesVolumeName {
+				continue
+			}
+			for _, item := range volume.Projected.Sources[0].ConfigMap.Items {
+				mounted = mounted || item.Path == rulesManifestFile
+			}
+		}
+		if want := manifest != ""; stored != want || mounted != want || value != manifest {
+			t.Fatalf("manifest %q: stored=%t mounted=%t value=%q", manifest, stored, mounted, value)
+		}
+	}
+}

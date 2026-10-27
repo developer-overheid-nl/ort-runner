@@ -134,7 +134,7 @@ de POST maximaal vijf keer; de scan zelf wordt daarbij niet herhaald.
 
 De Kubernetes-uitvoering vereist serverversie **1.33 of nieuwer** vanwege
 `backoffLimitPerIndex`. Een eerste controllerpoging leest de repositorylijst en
-slaat die met de ORT-regels (`evaluator.rules.kts`) op in onveranderlijke ConfigMaps. Een herstarte
+slaat die met de ORT-regels (`evaluator.rules.kts` en, indien aanwezig, `rules.yml`) op in onveranderlijke ConfigMaps. Een herstarte
 controller gebruikt die opgeslagen lijst, ook als het register intussen is
 gewijzigd. Kubernetes bewaart de voortgang in de Indexed Job; er is geen aparte
 database of queue.
@@ -240,7 +240,11 @@ Gebruik `docker run --rm ort-runner:dev --help` voor alle opties. De belangrijks
 De checkout bevat ook submodules op hun vastgelegde commits. Per scan maakt de runner
 een tijdelijke kopie van de configuratie en legt daarvan een SHA-256-vingerafdruk vast.
 Gebruik voor herhaalbare scans steeds dezelfde config-release of hetzelfde image-digest.
-De configuratiemap hoeft alleen een regulier bestand `evaluator.rules.kts` te bevatten.
+De configuratiemap moet een regulier bestand `evaluator.rules.kts` bevatten. Een
+optioneel `rules.yml` somt alle regels op met severity en scope (`repository` of
+`dependency`). Is dat bestand aanwezig, dan neemt de runner het mee in de
+vingerafdruk en rapporteert hij in `run.json` onder `rules` per regel of die
+geslaagd is. ORT zelf meldt alleen overtredingen. Zonder `rules.yml` ontbreekt `rules`.
 
 ## Resultaten en exitcodes
 

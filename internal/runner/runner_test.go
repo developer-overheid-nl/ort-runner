@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -379,5 +380,62 @@ func TestRunCommandStopsBackgroundProcesses(t *testing.T) {
 			t.Fatalf("background process %d still runs after the command finished", pid)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRunReportsPassedAndFailedRules(t *testing.T) {
+	cfg := setup(t, "completed")
+	withoutManifest, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutManifest.Rules != nil {
+		t.Fatalf("rules reported without a manifest: %#v", withoutManifest.Rules)
+	}
+
+	write(t, filepath.Join(cfg.ConfigDir, "rules.yml"), `rules:
+- {id: MISSING_README_FILE, severity: ERROR, scope: repository}
+- {id: MISSING_SECURITY_FILE, severity: ERROR, scope: repository}
+- {id: VULNERABILITY_IN_DEPENDENCY, severity: WARNING, scope: dependency}
+`)
+	got, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []RuleResult{
+		{Rule: "MISSING_README_FILE", Severity: "ERROR", Scope: "repository", Passed: true},
+		{Rule: "MISSING_SECURITY_FILE", Severity: "ERROR", Scope: "repository", Passed: false},
+		{Rule: "VULNERABILITY_IN_DEPENDENCY", Severity: "WARNING", Scope: "dependency", Passed: true},
+	}
+	data, err := os.ReadFile(filepath.Join(got.OutputDir, "run.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved Report
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(saved.Rules, want) {
+		t.Fatalf("rules = %#v, want %#v", saved.Rules, want)
+	}
+	if got.ConfigDigest == withoutManifest.ConfigDigest {
+		t.Fatal("rules manifest not included in the configuration fingerprint")
+	}
+}
+
+func TestInvalidRulesManifestIsRejected(t *testing.T) {
+	for name, manifest := range map[string]string{
+		"malformed":     "rules: [\n",
+		"missing id":    "rules: [{severity: ERROR, scope: repository}]\n",
+		"unknown scope": "rules: [{id: X, severity: ERROR, scope: project}]\n",
+		"duplicate":     "rules: [{id: X, severity: ERROR, scope: repository}, {id: X, severity: WARNING, scope: repository}]\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := setup(t, "completed")
+			write(t, filepath.Join(cfg.ConfigDir, "rules.yml"), manifest)
+			if got, err := Run(context.Background(), cfg); err == nil || got.Status != "failed" {
+				t.Fatalf("invalid rules manifest accepted: %+v, %v", got, err)
+			}
+		})
 	}
 }
