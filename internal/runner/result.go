@@ -114,6 +114,10 @@ func readResult(path, stage string, exitCode int) (resultInfo, error) {
 		direct, all := map[string]bool{}, map[string]bool{}
 		for _, project := range result.Analyzer.Result.Projects {
 			manager, key, _ := strings.Cut(project.ID, ":")
+			// ORT adds an Unmanaged project for files outside any package manager.
+			if manager == "Unmanaged" {
+				continue
+			}
 			projectDirect, projectAll := map[string]bool{}, map[string]bool{}
 			graph := result.Analyzer.Result.DependencyGraphs[manager]
 			graph.collect(key, projectDirect, projectAll)

@@ -153,6 +153,7 @@ func TestAnalyzerDependenciesAreCountedPerProject(t *testing.T) {
     - {id: "GoMod::example.org/app:abc", definition_file_path: go.mod}
     - {id: "GoMod::example.org/app/tools:abc", definition_file_path: tools/go.mod}
     - {id: "NPM::web:1.0.0", definition_file_path: web/package.json}
+    - {id: "Unmanaged::repo:abc", definition_file_path: ""}
     packages: [{id: "Go::a:1"}, {id: "Go::b:1"}, {id: "Go::c:1"}, {id: "Go::d:1"}]
     dependency_graphs:
       GoMod:
