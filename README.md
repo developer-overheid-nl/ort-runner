@@ -170,6 +170,12 @@ klaar waren. Dat gebeurt tot alles klaar is, een ronde niets oplevert of
 als mislukt en worden bij een ingesteld resultaatendpoint als mislukt gemeld.
 
 Worker-Jobs horen bij de controller-Job en worden samen met die Job opgeruimd.
+De Pods van een afgeronde ronde verwijdert de controller meteen, zodat mislukte
+Pods niet blijven staan zolang de batch loopt. Van elke mislukte Pod logt hij
+eerst de index en de oorzaak (bijvoorbeeld `Evicted` of `scan: OOMKilled`).
+Daarvoor heeft de ServiceAccount `list` en `delete` op Pods nodig; zonder die
+rechten logt hij een waarschuwing en blijven de Pods staan tot de controller-Job
+is opgeruimd.
 Een herstarte controller maakt een afgeronde ronde nooit opnieuw aan; ontbreekt
 de Job van zo'n ronde, dan stopt hij met een foutmelding. Tijdelijke API-fouten
 tijdens het wachten logt hij en probeert hij opnieuw.

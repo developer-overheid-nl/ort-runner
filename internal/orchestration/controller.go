@@ -202,7 +202,51 @@ func (b batch) runRound(ctx context.Context, resources WorkerResources) (*batchv
 	if err := createOrVerifyJob(ctx, b.client, desired); err != nil {
 		return nil, err
 	}
-	return waitForTerminalJob(ctx, b.client, b.cfg.Namespace, desired.Name)
+	job, err := waitForTerminalJob(ctx, b.client, b.cfg.Namespace, desired.Name)
+	if err != nil {
+		return nil, err
+	}
+	b.removeRoundPods(ctx, job)
+	return job, nil
+}
+
+// removeRoundPods deletes the Pods of a finished round. Otherwise failed Pods
+// stay behind until the controller Job is removed, which can take days. Why a
+// Pod failed is gone once it is deleted, so that is logged first. Errors are
+// only logged: the Pods are still removed together with the controller Job.
+func (b batch) removeRoundPods(ctx context.Context, job *batchv1.Job) {
+	pods, err := b.client.CoreV1().Pods(job.Namespace).List(ctx, metav1.ListOptions{LabelSelector: batchv1.JobNameLabel + "=" + job.Name})
+	if err != nil {
+		slog.Warn("Listing worker Pods failed; they are removed with the controller Job", "job", job.Name, "error", err)
+		return
+	}
+	for _, pod := range pods.Items {
+		if !metav1.IsControlledBy(&pod, job) {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodFailed {
+			slog.Warn("Worker Pod failed", "job", job.Name, "pod", pod.Name,
+				"index", pod.Annotations[batchv1.JobCompletionIndexAnnotation], "reason", podFailureReason(pod), "message", pod.Status.Message)
+		}
+		err := b.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			slog.Warn("Deleting worker Pod failed; it is removed with the controller Job", "pod", pod.Name, "error", err)
+		}
+	}
+}
+
+// podFailureReason names why a Pod failed: an eviction sets the Pod reason, an
+// OOM kill the reason of the terminated container.
+func podFailureReason(pod corev1.Pod) string {
+	if pod.Status.Reason != "" {
+		return pod.Status.Reason
+	}
+	for _, status := range slices.Concat(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses) {
+		if terminated := status.State.Terminated; terminated != nil && terminated.ExitCode != 0 {
+			return status.Name + ": " + terminated.Reason
+		}
+	}
+	return "unknown"
 }
 
 // roundManifest reuses the repository list an earlier controller attempt stored
