@@ -23,6 +23,7 @@ const (
 	chunkCountAnnotation = "ort-runner.developer.overheid.nl/chunk-count"
 	rulesFile            = "evaluator.rules.kts"
 	rulesManifestFile    = "rules.yml"
+	ortConfigFile        = "config.yml"
 	specHashAnnotation   = "ort-runner.developer.overheid.nl/spec-hash"
 	manifestChunkKey     = "chunk.json"
 	rulesVolumeName      = "rules"
@@ -55,6 +56,7 @@ type WorkerResources struct {
 	RepositoryCount int
 	Rules           []byte // evaluator.rules.kts
 	RulesManifest   []byte // rules.yml; optional
+	ORTConfig       []byte // config.yml; optional
 	ManifestChunks  []Chunk
 	// ResultEnvironment is passed only to the delivery container; see ResultEnvironment.
 	ResultEnvironment []corev1.EnvVar
@@ -149,12 +151,15 @@ func BuildConfigMaps(owner metav1.OwnerReference, namespace string, resources Wo
 	if len(resources.RulesManifest) > 0 {
 		rulesData[rulesManifestFile] = string(resources.RulesManifest)
 	}
+	if len(resources.ORTConfig) > 0 {
+		rulesData[ortConfigFile] = string(resources.ORTConfig)
+	}
 	maps := []*corev1.ConfigMap{{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            rulesConfigMapName(owner),
 			Namespace:       namespace,
 			OwnerReferences: []metav1.OwnerReference{owner},
-			Labels:          resourceLabels("rules", digest(append(slices.Clone(resources.Rules), resources.RulesManifest...))),
+			Labels:          resourceLabels("rules", digest(slices.Concat(resources.Rules, resources.RulesManifest, resources.ORTConfig))),
 		},
 		Immutable: &immutable,
 		Data:      rulesData,
@@ -195,6 +200,9 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 	rulesItems := []corev1.KeyToPath{{Key: rulesFile, Path: rulesFile}}
 	if len(resources.RulesManifest) > 0 {
 		rulesItems = append(rulesItems, corev1.KeyToPath{Key: rulesManifestFile, Path: rulesManifestFile})
+	}
+	if len(resources.ORTConfig) > 0 {
+		rulesItems = append(rulesItems, corev1.KeyToPath{Key: ortConfigFile, Path: ortConfigFile})
 	}
 	manifestSources := make([]corev1.VolumeProjection, 0, len(resources.ManifestChunks))
 	for _, chunk := range resources.ManifestChunks {

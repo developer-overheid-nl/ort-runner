@@ -134,7 +134,7 @@ de POST maximaal vijf keer; de scan zelf wordt daarbij niet herhaald.
 
 De Kubernetes-uitvoering vereist serverversie **1.33 of nieuwer** vanwege
 `backoffLimitPerIndex`. Een eerste controllerpoging leest de repositorylijst en
-slaat die met de ORT-regels (`evaluator.rules.kts` en, indien aanwezig, `rules.yml`) op in onveranderlijke ConfigMaps. Een herstarte
+slaat die met de ORT-regels (`evaluator.rules.kts` en, indien aanwezig, `rules.yml` en `config.yml`) op in onveranderlijke ConfigMaps. Een herstarte
 controller gebruikt die opgeslagen lijst, ook als het register intussen is
 gewijzigd. Kubernetes bewaart de voortgang in de Indexed Job; er is geen aparte
 database of queue.
@@ -245,6 +245,9 @@ optioneel `rules.yml` somt alle regels op met severity en scope (`repository` of
 `dependency`). Is dat bestand aanwezig, dan neemt de runner het mee in de
 vingerafdruk en rapporteert hij in `run.json` onder `rules` per regel of die
 geslaagd is. ORT zelf meldt alleen overtredingen. Zonder `rules.yml` ontbreekt `rules`.
+Een optioneel `config.yml` is de ORT-configuratie die elke ORT-stap via
+`ORT_CONFIG_DIR` leest, bijvoorbeeld om de Gradle-analyse met een andere
+Java-versie te laten draaien. Ook dat bestand telt mee in de vingerafdruk.
 
 ## Resultaten en exitcodes
 

@@ -44,16 +44,17 @@ func checkout(ctx context.Context, cfg Config, project, log string) (string, int
 }
 
 // Snapshot configuration so a local edit cannot change the files halfway through the ORT pipeline.
-// The rules manifest is optional; without it the report only lists violations.
+// The rules manifest and ORT configuration are optional; without a manifest the
+// report only lists violations, without config.yml ORT uses its defaults.
 func snapshotConfig(source, target string) (string, []ruleDefinition, error) {
 	if err := os.MkdirAll(target, 0700); err != nil {
 		return "", nil, err
 	}
 	digest := sha256.New()
 	var rules []ruleDefinition
-	for _, name := range []string{"evaluator.rules.kts", rulesManifest} {
+	for _, name := range []string{"evaluator.rules.kts", rulesManifest, ortConfig} {
 		info, err := os.Stat(filepath.Join(source, name))
-		if name == rulesManifest && errors.Is(err, fs.ErrNotExist) {
+		if name != "evaluator.rules.kts" && errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		if err != nil {
@@ -80,7 +81,10 @@ func snapshotConfig(source, target string) (string, []ruleDefinition, error) {
 	return fmt.Sprintf("sha256:%x", digest.Sum(nil)), rules, nil
 }
 
-const rulesManifest = "rules.yml"
+const (
+	rulesManifest = "rules.yml"
+	ortConfig     = "config.yml"
+)
 
 type ruleDefinition struct {
 	ID       string `yaml:"id"`

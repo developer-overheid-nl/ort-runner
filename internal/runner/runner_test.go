@@ -75,6 +75,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 printf 'running %s\n' "$stage"
+if [ -f "$ORT_CONFIG_DIR/config.yml" ]; then cat "$ORT_CONFIG_DIR/config.yml"; fi
 case "$stage" in
   analyze)
     test "$(cat "$input/README.md")" = 'requested commit'
@@ -420,6 +421,33 @@ func TestRunReportsPassedAndFailedRules(t *testing.T) {
 	}
 	if got.ConfigDigest == withoutManifest.ConfigDigest {
 		t.Fatal("rules manifest not included in the configuration fingerprint")
+	}
+}
+
+func TestORTConfigurationReachesEveryStage(t *testing.T) {
+	cfg := setup(t, "completed")
+	withoutConfig, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const ortConfiguration = "ort:\n  analyzer:\n    packageManagers:\n      GradleInspector:\n        options:\n          javaVersion: \"17\"\n"
+	write(t, filepath.Join(cfg.ConfigDir, "config.yml"), ortConfiguration)
+	got, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range got.Stages[1:] {
+		log, err := os.ReadFile(filepath.Join(got.OutputDir, stage.Log))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(log), ortConfiguration) {
+			t.Fatalf("%s did not see config.yml:\n%s", stage.Name, log)
+		}
+	}
+	if got.ConfigDigest == withoutConfig.ConfigDigest {
+		t.Fatal("ORT configuration not included in the configuration fingerprint")
 	}
 }
 

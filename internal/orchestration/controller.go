@@ -95,11 +95,16 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 	if err != nil {
 		return BatchSummary{}, err
 	}
+	ortConfig, err := readOptional(cfg.ConfigDir, ortConfigFile)
+	if err != nil {
+		return BatchSummary{}, err
+	}
 	template := WorkerResources{
 		Image:             image,
 		BatchID:           cfg.BatchName,
 		Rules:             rules,
 		RulesManifest:     rulesManifest,
+		ORTConfig:         ortConfig,
 		ResultEnvironment: ResultEnvironment(environment),
 		Settings:          cfg.Settings,
 	}
@@ -385,11 +390,19 @@ func readRules(configDir string) ([]byte, []byte, error) {
 	if len(rules) == 0 {
 		return nil, nil, fmt.Errorf("%s is empty", rulesFile)
 	}
-	manifest, err := os.ReadFile(filepath.Join(configDir, rulesManifestFile))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, nil, fmt.Errorf("read %s: %w", rulesManifestFile, err)
+	manifest, err := readOptional(configDir, rulesManifestFile)
+	if err != nil {
+		return nil, nil, err
 	}
 	return rules, manifest, nil
+}
+
+func readOptional(configDir, name string) ([]byte, error) {
+	data, err := os.ReadFile(filepath.Join(configDir, name))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	return data, nil
 }
 
 // Existing batch resources are never updated: a difference means another
