@@ -1,0 +1,3 @@
+kind: Added
+body: Geef een optioneel `config.yml` uit de configuratie als ORT-configuratie door aan elke ORT-stap en aan de Kubernetes-workers, zodat bijvoorbeeld de Java-versie voor de Gradle-analyse in te stellen is.
+time: 2026-10-29T14:00:00+01:00

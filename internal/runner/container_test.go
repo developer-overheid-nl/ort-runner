@@ -117,6 +117,16 @@ func TestContainerBaseline(t *testing.T) {
 			} else if len(report.Findings) != 1 || report.Findings[0].Rule != "MISSING_SECURITY_FILE" || *report.Stages[3].ExitCode != 2 {
 				t.Fatalf("missing security file not reported correctly: %s", data)
 			}
+			if _, err := os.Stat(filepath.Join(config, rulesManifest)); err == nil {
+				if len(report.Rules) == 0 {
+					t.Fatalf("rules manifest present but no rule results: %s", data)
+				}
+				for _, rule := range report.Rules {
+					if rule.Passed != (rule.Rule != "MISSING_SECURITY_FILE" || securityPresent) {
+						t.Fatalf("unexpected rule result %+v: %s", rule, data)
+					}
+				}
+			}
 		})
 	}
 }
