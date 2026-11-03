@@ -2,7 +2,9 @@ package orchestration
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -89,7 +91,11 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 	if summary.Total == 0 {
 		return summary, nil
 	}
-	rules, err := readRules(cfg.ConfigDir)
+	rules, rulesManifest, err := readRules(cfg.ConfigDir)
+	if err != nil {
+		return BatchSummary{}, err
+	}
+	ortConfig, err := readOptional(cfg.ConfigDir, ortConfigFile)
 	if err != nil {
 		return BatchSummary{}, err
 	}
@@ -97,6 +103,8 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 		Image:             image,
 		BatchID:           cfg.BatchName,
 		Rules:             rules,
+		RulesManifest:     rulesManifest,
+		ORTConfig:         ortConfig,
 		ResultEnvironment: ResultEnvironment(environment),
 		Settings:          cfg.Settings,
 	}
@@ -372,16 +380,29 @@ func inspectControllerPod(pod *corev1.Pod, containerName string) (metav1.OwnerRe
 	return metav1.OwnerReference{}, "", nil, fmt.Errorf("controller container %q not found", containerName)
 }
 
-// readRules reads the evaluator rules; it is the only file ORT is given.
-func readRules(configDir string) ([]byte, error) {
+// readRules reads the evaluator rules, which ORT is given, and the optional
+// rules manifest, which the worker uses to report passed rules.
+func readRules(configDir string) ([]byte, []byte, error) {
 	rules, err := os.ReadFile(filepath.Join(configDir, rulesFile))
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", rulesFile, err)
+		return nil, nil, fmt.Errorf("read %s: %w", rulesFile, err)
 	}
 	if len(rules) == 0 {
-		return nil, fmt.Errorf("%s is empty", rulesFile)
+		return nil, nil, fmt.Errorf("%s is empty", rulesFile)
 	}
-	return rules, nil
+	manifest, err := readOptional(configDir, rulesManifestFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rules, manifest, nil
+}
+
+func readOptional(configDir, name string) ([]byte, error) {
+	data, err := os.ReadFile(filepath.Join(configDir, name))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	return data, nil
 }
 
 // Existing batch resources are never updated: a difference means another
