@@ -282,18 +282,18 @@ of onleesbaar resultaat stopt de vervolgstappen.
 
 `completed` beschrijft de uitvoering; het is geen verklaring dat een project veilig
 of volledig onderzocht is. `package_count: 0` betekent dat geen dependencies zijn
-gevonden. Sommige OSV-fouten in ORT 92.4.0 verschijnen alleen in logs; de runner kan
+gevonden. Sommige OSV-fouten verschijnen mogelijk alleen in logs; de runner kan
 alleen problemen classificeren die ORT in exitcodes of resultaten teruggeeft.
 De huidige pipeline bevat geen Scanner-stap en hydrateert Git LFS-bestanden niet.
 
 ## ORT-versies afzonderlijk testen
 
-De Dockerfile gebruikt ORT `92.4.0`, vastgezet met een image-digest. Bouw een kandidaat
+De Dockerfile gebruikt ORT `97.3.0`, vastgezet met een image-digest. Bouw een kandidaat
 door alleen het buildargument te wijzigen:
 
 ```sh
 docker build \
-  --build-arg ORT_IMAGE=ghcr.io/oss-review-toolkit/ort:92.4.0 \
+  --build-arg ORT_IMAGE=ghcr.io/oss-review-toolkit/ort:97.3.0 \
   --build-arg RUNNER_VERSION="$(git rev-parse HEAD)" \
   -t ort-runner:candidate .
 
