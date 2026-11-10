@@ -282,7 +282,7 @@ De huidige pipeline bevat geen Scanner-stap en hydrateert Git LFS-bestanden niet
 
 ## ORT-versies afzonderlijk testen
 
-De Dockerfile gebruikt ORT `92.4.0`, vastgezet met een image-digest. Bouw een kandidaat
+De Dockerfile gebruikt ORT `98.0.0`, vastgezet met een image-digest. Bouw een kandidaat
 door alleen het buildargument te wijzigen:
 
 ```sh

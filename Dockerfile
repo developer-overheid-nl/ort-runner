@@ -1,5 +1,5 @@
 # Override ORT_IMAGE to build and test another ORT release without changing the runner.
-ARG ORT_IMAGE=ghcr.io/oss-review-toolkit/ort:92.4.0@sha256:748afc9d459f6d2bb1dde90fe4bc378d8ea2c756f8c5e19607290ae42446a1d1
+ARG ORT_IMAGE=ghcr.io/oss-review-toolkit/ort:98.0.0@sha256:f58e500173b7e82fcec42deb931906159814a4bac03ef34e121b310bf7f628ff
 ARG GO_IMAGE=golang:1.26.5-bookworm
 
 FROM ${GO_IMAGE} AS build
