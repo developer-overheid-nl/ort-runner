@@ -15,6 +15,9 @@ import (
 
 // This test exercises the actual ORT image and the separately versioned baseline rules.
 // The fixture has no dependencies: networked vulnerability coverage needs its own test repositories.
+// Its CI configuration is GitLab CI rather than a GitHub Actions workflow: since ORT 97 the
+// GitHubAction analyzer fails on a repository cloned from a local path, which this test needs;
+// remote repositories are not affected.
 func TestContainerBaseline(t *testing.T) {
 	config := os.Getenv("ORT_RUNNER_TEST_CONFIG_DIR")
 	if config == "" {
@@ -32,19 +35,19 @@ func TestContainerBaseline(t *testing.T) {
 		t.Run(fmt.Sprintf("security_present_%t", securityPresent), func(t *testing.T) {
 			root := t.TempDir()
 			repo, output := filepath.Join(root, "repo"), filepath.Join(root, "output")
-			for _, dir := range []string{filepath.Join(repo, ".github", "workflows"), output} {
+			for _, dir := range []string{repo, output} {
 				if err := os.MkdirAll(dir, 0755); err != nil {
 					t.Fatal(err)
 				}
 			}
 			files := map[string]string{
-				"README.md":                "# ORT runner integration fixture\n",
-				"LICENSE":                  "SPDX-License-Identifier: MIT\n",
-				"publiccode.yml":           "publiccodeYmlVersion: '0.5'\nname: ort-runner-fixture\n",
-				"CONTRIBUTING.md":          "# Contributing\n",
-				"CODE_OF_CONDUCT.md":       "# Code of conduct\n",
-				"CHANGELOG":                "Initial fixture.\n",
-				".github/workflows/ci.yml": "name: Fixture\non: workflow_dispatch\njobs: {}\n",
+				"README.md":          "# ORT runner integration fixture\n",
+				"LICENSE":            "SPDX-License-Identifier: MIT\n",
+				"publiccode.yml":     "publiccodeYmlVersion: '0.5'\nname: ort-runner-fixture\n",
+				"CONTRIBUTING.md":    "# Contributing\n",
+				"CODE_OF_CONDUCT.md": "# Code of conduct\n",
+				"CHANGELOG":          "Initial fixture.\n",
+				".gitlab-ci.yml":     "test:\n  script: [\"true\"]\n",
 			}
 			if securityPresent {
 				files["SECURITY.md"] = "# Reporting a vulnerability\n"
@@ -116,6 +119,16 @@ func TestContainerBaseline(t *testing.T) {
 				}
 			} else if len(report.Findings) != 1 || report.Findings[0].Rule != "MISSING_SECURITY_FILE" || *report.Stages[3].ExitCode != 2 {
 				t.Fatalf("missing security file not reported correctly: %s", data)
+			}
+			if _, err := os.Stat(filepath.Join(config, rulesManifest)); err == nil {
+				if len(report.Rules) == 0 {
+					t.Fatalf("rules manifest present but no rule results: %s", data)
+				}
+				for _, rule := range report.Rules {
+					if rule.Passed != (rule.Rule != "MISSING_SECURITY_FILE" || securityPresent) {
+						t.Fatalf("unexpected rule result %+v: %s", rule, data)
+					}
+				}
 			}
 		})
 	}

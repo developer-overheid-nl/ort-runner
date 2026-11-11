@@ -337,6 +337,69 @@ func TestRunControllerNeverRecreatesAFinishedRound(t *testing.T) {
 	}
 }
 
+func TestRunControllerRemovesPodsOfFinishedRound(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}, {ID: "b", URL: "https://example.test/b.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	other := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "oss"}}
+	client := fake.NewSimpleClientset(controllerPod(), other)
+	evicted := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-1", Annotations: map[string]string{batchv1.JobCompletionIndexAnnotation: "1"}},
+		Status:     corev1.PodStatus{Phase: corev1.PodFailed, Reason: "Evicted", Message: "The node was low on resource: ephemeral-storage."},
+	}
+	finishJobs(t, client, jobResult{completed: "0", failed: "1", reason: batchv1.JobReasonFailedIndexes, pods: []corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "worker-0"}, Status: corev1.PodStatus{Phase: corev1.PodSucceeded}},
+		evicted,
+	}})
+
+	if _, err := RunController(context.Background(), client, controllerConfig(t, server.URL)); err != nil {
+		t.Fatal(err)
+	}
+	pods, _ := client.CoreV1().Pods("oss").List(context.Background(), metav1.ListOptions{})
+	var names []string
+	for _, pod := range pods.Items {
+		names = append(names, pod.Name)
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"controller-pod", "other"}) {
+		t.Fatalf("remaining pods=%v", names)
+	}
+}
+
+func TestRunControllerToleratesFailingPodCleanup(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	client.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("no list permission"))
+	})
+	finishJobs(t, client, jobResult{completed: "0"})
+
+	summary, err := RunController(context.Background(), client, controllerConfig(t, server.URL))
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+}
+
+func TestPodFailureReason(t *testing.T) {
+	oom := corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
+		Name: "scan", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled"}},
+	}}}}
+	for _, tc := range []struct {
+		pod  corev1.Pod
+		want string
+	}{
+		{corev1.Pod{Status: corev1.PodStatus{Reason: "Evicted"}}, "Evicted"},
+		{oom, "scan: OOMKilled"},
+		{corev1.Pod{}, "unknown"},
+	} {
+		if got := podFailureReason(tc.pod); got != tc.want {
+			t.Fatalf("reason=%q want %q", got, tc.want)
+		}
+	}
+}
+
 func TestRunControllerSurvivesTransientAPIErrors(t *testing.T) {
 	server := repositoryServer(t, []register.Repository{{ID: "a", URL: "https://example.test/a.git"}})
 	defer server.Close()
@@ -457,6 +520,8 @@ func repositoryServer(t *testing.T, repositories []register.Repository) *httptes
 type jobResult struct {
 	completed, failed string
 	reason            string // empty: the Job completed
+	// pods are created as Pods of the worker Job before it finishes.
+	pods []corev1.Pod
 }
 
 // finishJobs gives each new worker Job, in creation order, the next result.
@@ -472,6 +537,14 @@ func finishJobs(t *testing.T, client *fake.Clientset, results ...jobResult) {
 					continue
 				}
 				result := results[len(finished)]
+				for _, pod := range result.pods {
+					pod.Namespace = item.Namespace
+					pod.Labels = map[string]string{batchv1.JobNameLabel: item.Name}
+					pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(&item, batchv1.SchemeGroupVersion.WithKind("Job"))}
+					if _, err := client.CoreV1().Pods("oss").Create(context.Background(), &pod, metav1.CreateOptions{}); err != nil {
+						t.Errorf("create worker pod: %v", err)
+					}
+				}
 				job := item.DeepCopy()
 				if job.CreationTimestamp.IsZero() {
 					// The fake client does not set it; the API server always does.

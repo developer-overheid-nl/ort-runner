@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -74,6 +75,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 printf 'running %s\n' "$stage"
+if [ -f "$ORT_CONFIG_DIR/config.yml" ]; then cat "$ORT_CONFIG_DIR/config.yml"; fi
 case "$stage" in
   analyze)
     test "$(cat "$input/README.md")" = 'requested commit'
@@ -181,7 +183,7 @@ func TestRunChecksOutRequestedCommitAndKeepsFindings(t *testing.T) {
 	if err := json.Unmarshal(data, &saved); err != nil {
 		t.Fatal(err)
 	}
-	if saved.Status != "completed" || saved.FinishedAt == nil {
+	if saved.Status != "completed" || saved.FinishedAt == nil || saved.Dependencies == nil {
 		t.Fatalf("incomplete saved report: %+v", saved)
 	}
 	if saved.ConfigDigest == "" {
@@ -379,5 +381,89 @@ func TestRunCommandStopsBackgroundProcesses(t *testing.T) {
 			t.Fatalf("background process %d still runs after the command finished", pid)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRunReportsPassedAndFailedRules(t *testing.T) {
+	cfg := setup(t, "completed")
+	withoutManifest, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutManifest.Rules != nil {
+		t.Fatalf("rules reported without a manifest: %#v", withoutManifest.Rules)
+	}
+
+	write(t, filepath.Join(cfg.ConfigDir, "rules.yml"), `rules:
+- {id: MISSING_README_FILE, severity: ERROR, scope: repository}
+- {id: MISSING_SECURITY_FILE, severity: ERROR, scope: repository}
+- {id: VULNERABILITY_IN_DEPENDENCY, severity: WARNING, scope: dependency}
+`)
+	got, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []RuleResult{
+		{Rule: "MISSING_README_FILE", Severity: "ERROR", Scope: "repository", Passed: true},
+		{Rule: "MISSING_SECURITY_FILE", Severity: "ERROR", Scope: "repository", Passed: false},
+		{Rule: "VULNERABILITY_IN_DEPENDENCY", Severity: "WARNING", Scope: "dependency", Passed: true},
+	}
+	data, err := os.ReadFile(filepath.Join(got.OutputDir, "run.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved Report
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(saved.Rules, want) {
+		t.Fatalf("rules = %#v, want %#v", saved.Rules, want)
+	}
+	if got.ConfigDigest == withoutManifest.ConfigDigest {
+		t.Fatal("rules manifest not included in the configuration fingerprint")
+	}
+}
+
+func TestORTConfigurationReachesEveryStage(t *testing.T) {
+	cfg := setup(t, "completed")
+	withoutConfig, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const ortConfiguration = "ort:\n  analyzer:\n    packageManagers:\n      GradleInspector:\n        options:\n          javaVersion: \"17\"\n"
+	write(t, filepath.Join(cfg.ConfigDir, "config.yml"), ortConfiguration)
+	got, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range got.Stages[1:] {
+		log, err := os.ReadFile(filepath.Join(got.OutputDir, stage.Log))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(log), ortConfiguration) {
+			t.Fatalf("%s did not see config.yml:\n%s", stage.Name, log)
+		}
+	}
+	if got.ConfigDigest == withoutConfig.ConfigDigest {
+		t.Fatal("ORT configuration not included in the configuration fingerprint")
+	}
+}
+
+func TestInvalidRulesManifestIsRejected(t *testing.T) {
+	for name, manifest := range map[string]string{
+		"malformed":     "rules: [\n",
+		"missing id":    "rules: [{severity: ERROR, scope: repository}]\n",
+		"unknown scope": "rules: [{id: X, severity: ERROR, scope: project}]\n",
+		"duplicate":     "rules: [{id: X, severity: ERROR, scope: repository}, {id: X, severity: WARNING, scope: repository}]\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := setup(t, "completed")
+			write(t, filepath.Join(cfg.ConfigDir, "rules.yml"), manifest)
+			if got, err := Run(context.Background(), cfg); err == nil || got.Status != "failed" {
+				t.Fatalf("invalid rules manifest accepted: %+v, %v", got, err)
+			}
+		})
 	}
 }

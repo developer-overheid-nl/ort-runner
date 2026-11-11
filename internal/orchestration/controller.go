@@ -2,7 +2,9 @@ package orchestration
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -89,7 +91,11 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 	if summary.Total == 0 {
 		return summary, nil
 	}
-	rules, err := readRules(cfg.ConfigDir)
+	rules, rulesManifest, err := readRules(cfg.ConfigDir)
+	if err != nil {
+		return BatchSummary{}, err
+	}
+	ortConfig, err := readOptional(cfg.ConfigDir, ortConfigFile)
 	if err != nil {
 		return BatchSummary{}, err
 	}
@@ -97,6 +103,8 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 		Image:             image,
 		BatchID:           cfg.BatchName,
 		Rules:             rules,
+		RulesManifest:     rulesManifest,
+		ORTConfig:         ortConfig,
 		ResultEnvironment: ResultEnvironment(environment),
 		Settings:          cfg.Settings,
 	}
@@ -202,7 +210,51 @@ func (b batch) runRound(ctx context.Context, resources WorkerResources) (*batchv
 	if err := createOrVerifyJob(ctx, b.client, desired); err != nil {
 		return nil, err
 	}
-	return waitForTerminalJob(ctx, b.client, b.cfg.Namespace, desired.Name)
+	job, err := waitForTerminalJob(ctx, b.client, b.cfg.Namespace, desired.Name)
+	if err != nil {
+		return nil, err
+	}
+	b.removeRoundPods(ctx, job)
+	return job, nil
+}
+
+// removeRoundPods deletes the Pods of a finished round. Otherwise failed Pods
+// stay behind until the controller Job is removed, which can take days. Why a
+// Pod failed is gone once it is deleted, so that is logged first. Errors are
+// only logged: the Pods are still removed together with the controller Job.
+func (b batch) removeRoundPods(ctx context.Context, job *batchv1.Job) {
+	pods, err := b.client.CoreV1().Pods(job.Namespace).List(ctx, metav1.ListOptions{LabelSelector: batchv1.JobNameLabel + "=" + job.Name})
+	if err != nil {
+		slog.Warn("Listing worker Pods failed; they are removed with the controller Job", "job", job.Name, "error", err)
+		return
+	}
+	for _, pod := range pods.Items {
+		if !metav1.IsControlledBy(&pod, job) {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodFailed {
+			slog.Warn("Worker Pod failed", "job", job.Name, "pod", pod.Name,
+				"index", pod.Annotations[batchv1.JobCompletionIndexAnnotation], "reason", podFailureReason(pod), "message", pod.Status.Message)
+		}
+		err := b.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			slog.Warn("Deleting worker Pod failed; it is removed with the controller Job", "pod", pod.Name, "error", err)
+		}
+	}
+}
+
+// podFailureReason names why a Pod failed: an eviction sets the Pod reason, an
+// OOM kill the reason of the terminated container.
+func podFailureReason(pod corev1.Pod) string {
+	if pod.Status.Reason != "" {
+		return pod.Status.Reason
+	}
+	for _, status := range slices.Concat(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses) {
+		if terminated := status.State.Terminated; terminated != nil && terminated.ExitCode != 0 {
+			return status.Name + ": " + terminated.Reason
+		}
+	}
+	return "unknown"
 }
 
 // roundManifest reuses the repository list an earlier controller attempt stored
@@ -328,16 +380,29 @@ func inspectControllerPod(pod *corev1.Pod, containerName string) (metav1.OwnerRe
 	return metav1.OwnerReference{}, "", nil, fmt.Errorf("controller container %q not found", containerName)
 }
 
-// readRules reads the evaluator rules; it is the only file ORT is given.
-func readRules(configDir string) ([]byte, error) {
+// readRules reads the evaluator rules, which ORT is given, and the optional
+// rules manifest, which the worker uses to report passed rules.
+func readRules(configDir string) ([]byte, []byte, error) {
 	rules, err := os.ReadFile(filepath.Join(configDir, rulesFile))
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", rulesFile, err)
+		return nil, nil, fmt.Errorf("read %s: %w", rulesFile, err)
 	}
 	if len(rules) == 0 {
-		return nil, fmt.Errorf("%s is empty", rulesFile)
+		return nil, nil, fmt.Errorf("%s is empty", rulesFile)
 	}
-	return rules, nil
+	manifest, err := readOptional(configDir, rulesManifestFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rules, manifest, nil
+}
+
+func readOptional(configDir, name string) ([]byte, error) {
+	data, err := os.ReadFile(filepath.Join(configDir, name))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	return data, nil
 }
 
 // Existing batch resources are never updated: a difference means another

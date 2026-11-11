@@ -134,7 +134,7 @@ de POST maximaal vijf keer; de scan zelf wordt daarbij niet herhaald.
 
 De Kubernetes-uitvoering vereist serverversie **1.33 of nieuwer** vanwege
 `backoffLimitPerIndex`. Een eerste controllerpoging leest de repositorylijst en
-slaat die met de ORT-regels (`evaluator.rules.kts`) op in onveranderlijke ConfigMaps. Een herstarte
+slaat die met de ORT-regels (`evaluator.rules.kts` en, indien aanwezig, `rules.yml` en `config.yml`) op in onveranderlijke ConfigMaps. Een herstarte
 controller gebruikt die opgeslagen lijst, ook als het register intussen is
 gewijzigd. Kubernetes bewaart de voortgang in de Indexed Job; er is geen aparte
 database of queue.
@@ -170,6 +170,12 @@ klaar waren. Dat gebeurt tot alles klaar is, een ronde niets oplevert of
 als mislukt en worden bij een ingesteld resultaatendpoint als mislukt gemeld.
 
 Worker-Jobs horen bij de controller-Job en worden samen met die Job opgeruimd.
+De Pods van een afgeronde ronde verwijdert de controller meteen, zodat mislukte
+Pods niet blijven staan zolang de batch loopt. Van elke mislukte Pod logt hij
+eerst de index en de oorzaak (bijvoorbeeld `Evicted` of `scan: OOMKilled`).
+Daarvoor heeft de ServiceAccount `list` en `delete` op Pods nodig; zonder die
+rechten logt hij een waarschuwing en blijven de Pods staan tot de controller-Job
+is opgeruimd.
 Een herstarte controller maakt een afgeronde ronde nooit opnieuw aan; ontbreekt
 de Job van zo'n ronde, dan stopt hij met een foutmelding. Tijdelijke API-fouten
 tijdens het wachten logt hij en probeert hij opnieuw.
@@ -234,7 +240,14 @@ Gebruik `docker run --rm ort-runner:dev --help` voor alle opties. De belangrijks
 De checkout bevat ook submodules op hun vastgelegde commits. Per scan maakt de runner
 een tijdelijke kopie van de configuratie en legt daarvan een SHA-256-vingerafdruk vast.
 Gebruik voor herhaalbare scans steeds dezelfde config-release of hetzelfde image-digest.
-De configuratiemap hoeft alleen een regulier bestand `evaluator.rules.kts` te bevatten.
+De configuratiemap moet een regulier bestand `evaluator.rules.kts` bevatten. Een
+optioneel `rules.yml` somt alle regels op met severity en scope (`repository` of
+`dependency`). Is dat bestand aanwezig, dan neemt de runner het mee in de
+vingerafdruk en rapporteert hij in `run.json` onder `rules` per regel of die
+geslaagd is. ORT zelf meldt alleen overtredingen. Zonder `rules.yml` ontbreekt `rules`.
+Een optioneel `config.yml` is de ORT-configuratie die elke ORT-stap via
+`ORT_CONFIG_DIR` leest, bijvoorbeeld om de Gradle-analyse met een andere
+Java-versie te laten draaien. Ook dat bestand telt mee in de vingerafdruk.
 
 ## Resultaten en exitcodes
 
@@ -254,7 +267,12 @@ run-123456/
 ```
 
 `run.json` bevat de commit, config-vingerafdruk, image, ORT-versies, tijden, status
-en exitcode per stap, de OSV-kwetsbaarheden en de regelovertredingen. Per kwetsbaarheid
+en exitcode per stap, een dependency-overzicht, de OSV-kwetsbaarheden en de
+regelovertredingen. Het dependency-overzicht (`dependencies`) bevat per gevonden
+projectbestand de package manager en het aantal directe en transitieve dependencies,
+plus de totalen over de hele repository. In de totalen telt elk package één keer:
+een package dat in het ene project direct en in het andere transitief is, telt als
+direct. Per kwetsbaarheid
 worden het package, advisory-id, samenvatting, beschikbare score en eerste opgeloste
 versies opgenomen. Bij een fout blijven reeds gemaakte resultaten en logs bewaard.
 De tijdelijke broncode en config-kopie worden opgeruimd.
@@ -276,18 +294,18 @@ of onleesbaar resultaat stopt de vervolgstappen.
 
 `completed` beschrijft de uitvoering; het is geen verklaring dat een project veilig
 of volledig onderzocht is. `package_count: 0` betekent dat geen dependencies zijn
-gevonden. Sommige OSV-fouten in ORT 92.4.0 verschijnen alleen in logs; de runner kan
+gevonden. Sommige OSV-fouten verschijnen mogelijk alleen in logs; de runner kan
 alleen problemen classificeren die ORT in exitcodes of resultaten teruggeeft.
 De huidige pipeline bevat geen Scanner-stap en hydrateert Git LFS-bestanden niet.
 
 ## ORT-versies afzonderlijk testen
 
-De Dockerfile gebruikt ORT `92.4.0`, vastgezet met een image-digest. Bouw een kandidaat
+De Dockerfile gebruikt ORT `98.0.0`, vastgezet met een image-digest. Bouw een kandidaat
 door alleen het buildargument te wijzigen:
 
 ```sh
 docker build \
-  --build-arg ORT_IMAGE=ghcr.io/oss-review-toolkit/ort:92.4.0 \
+  --build-arg ORT_IMAGE=ghcr.io/oss-review-toolkit/ort:97.3.0 \
   --build-arg RUNNER_VERSION="$(git rev-parse HEAD)" \
   -t ort-runner:candidate .
 

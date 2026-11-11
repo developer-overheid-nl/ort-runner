@@ -22,6 +22,8 @@ const (
 	resourceDigestLabel  = "ort-runner.developer.overheid.nl/digest"
 	chunkCountAnnotation = "ort-runner.developer.overheid.nl/chunk-count"
 	rulesFile            = "evaluator.rules.kts"
+	rulesManifestFile    = "rules.yml"
+	ortConfigFile        = "config.yml"
 	specHashAnnotation   = "ort-runner.developer.overheid.nl/spec-hash"
 	manifestChunkKey     = "chunk.json"
 	rulesVolumeName      = "rules"
@@ -53,6 +55,8 @@ type WorkerResources struct {
 	BatchID         string
 	RepositoryCount int
 	Rules           []byte // evaluator.rules.kts
+	RulesManifest   []byte // rules.yml; optional
+	ORTConfig       []byte // config.yml; optional
 	ManifestChunks  []Chunk
 	// ResultEnvironment is passed only to the delivery container; see ResultEnvironment.
 	ResultEnvironment []corev1.EnvVar
@@ -144,12 +148,18 @@ func BuildConfigMaps(owner metav1.OwnerReference, namespace string, resources Wo
 	}
 	immutable := true
 	rulesData := map[string]string{rulesFile: string(resources.Rules), "gradle.properties": gradleProperties}
+	if len(resources.RulesManifest) > 0 {
+		rulesData[rulesManifestFile] = string(resources.RulesManifest)
+	}
+	if len(resources.ORTConfig) > 0 {
+		rulesData[ortConfigFile] = string(resources.ORTConfig)
+	}
 	maps := []*corev1.ConfigMap{{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            rulesConfigMapName(owner),
 			Namespace:       namespace,
 			OwnerReferences: []metav1.OwnerReference{owner},
-			Labels:          resourceLabels("rules", digest(resources.Rules)),
+			Labels:          resourceLabels("rules", digest(slices.Concat(resources.Rules, resources.RulesManifest, resources.ORTConfig))),
 		},
 		Immutable: &immutable,
 		Data:      rulesData,
@@ -187,6 +197,13 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 		return nil, err
 	}
 
+	rulesItems := []corev1.KeyToPath{{Key: rulesFile, Path: rulesFile}}
+	if len(resources.RulesManifest) > 0 {
+		rulesItems = append(rulesItems, corev1.KeyToPath{Key: rulesManifestFile, Path: rulesManifestFile})
+	}
+	if len(resources.ORTConfig) > 0 {
+		rulesItems = append(rulesItems, corev1.KeyToPath{Key: ortConfigFile, Path: ortConfigFile})
+	}
 	manifestSources := make([]corev1.VolumeProjection, 0, len(resources.ManifestChunks))
 	for _, chunk := range resources.ManifestChunks {
 		manifestSources = append(manifestSources, configMapProjection(manifestConfigMapName(owner, resources.Round, chunk.Index),
@@ -261,7 +278,7 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 					InitContainers: []corev1.Container{scan},
 					Containers:     []corev1.Container{deliver},
 					Volumes: []corev1.Volume{
-						projectedVolume(rulesVolumeName, configMapProjection(rulesConfigMapName(owner), corev1.KeyToPath{Key: rulesFile, Path: rulesFile})),
+						projectedVolume(rulesVolumeName, configMapProjection(rulesConfigMapName(owner), rulesItems...)),
 						projectedVolume(manifestVolumeName, manifestSources...),
 						projectedVolume(gradleVolumeName, configMapProjection(rulesConfigMapName(owner), corev1.KeyToPath{Key: "gradle.properties", Path: "gradle.properties"})),
 						{Name: outputVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
