@@ -138,13 +138,9 @@ func loadControllerConfig() (controllerConfig, error) {
 func loadWorkerConfig() (worker.ScanConfig, error) {
 	var e env
 	timeout := e.duration("ORT_REPOSITORY_TIMEOUT", 10*time.Minute)
-	index := e.int("JOB_COMPLETION_INDEX", -1)
-	if index < 0 {
-		e.errs = append(e.errs, errors.New("JOB_COMPLETION_INDEX must be a non-negative integer"))
-	}
 	cfg := worker.ScanConfig{
 		BatchID:         e.required("ORT_BATCH_ID"),
-		CompletionIndex: index,
+		CompletionIndex: e.completionIndex(),
 		ManifestDir:     e.required("ORT_MANIFEST_DIR"),
 		Timeout:         timeout,
 		Runner: runner.Config{
@@ -159,6 +155,15 @@ func loadWorkerConfig() (worker.ScanConfig, error) {
 	return cfg, e.err()
 }
 
+// completionIndex reads the index Kubernetes sets in every container of an Indexed Job Pod.
+func (e *env) completionIndex() int {
+	index := e.int("JOB_COMPLETION_INDEX", -1)
+	if index < 0 {
+		e.errs = append(e.errs, errors.New("JOB_COMPLETION_INDEX must be a non-negative integer"))
+	}
+	return index
+}
+
 type deliverConfig struct {
 	Worker worker.DeliverConfig
 	HTTP   httpSettings
@@ -168,9 +173,11 @@ func loadDeliverConfig() (deliverConfig, error) {
 	var e env
 	cfg := deliverConfig{
 		Worker: worker.DeliverConfig{
-			BatchID:    e.required("ORT_BATCH_ID"),
-			OutputDir:  e.string("ORT_OUTPUT_DIR", "/output"),
-			ResultsURL: os.Getenv(register.ResultsURLVariable),
+			BatchID:         e.required("ORT_BATCH_ID"),
+			CompletionIndex: e.completionIndex(),
+			ManifestDir:     e.required("ORT_MANIFEST_DIR"),
+			OutputDir:       e.string("ORT_OUTPUT_DIR", "/output"),
+			ResultsURL:      os.Getenv(register.ResultsURLVariable),
 		},
 		HTTP: httpSettings{Timeout: e.duration("ORT_HTTP_TIMEOUT", 30*time.Second), Auth: e.auth()},
 	}
