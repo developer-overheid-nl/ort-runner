@@ -146,7 +146,10 @@ Een worker-Pod heeft twee stappen:
    ServiceAccount-token of service-links.
 2. **Levering** (`ort-runner deliver`, kleine container): stuurt `submission.json`
    met een vaste idempotency-key (`ort:<sha256>`) naar `ORT_RESULTS_URL` en probeert
-   dat maximaal vijf keer. Alleen deze stap krijgt de OAuth-gegevens.
+   dat maximaal vijf keer. Alleen deze stap krijgt de OAuth-gegevens. De scan kan
+   `submission.json` aanpassen, dus de levering bepaalt de repository zelf uit het
+   read-only manifest en `JOB_COMPLETION_INDEX`. Een submission voor een andere
+   repository, of een bestand groter dan 16 MiB, wordt niet verstuurd.
 
 De scan vraagt standaard `200m` CPU, `4Gi` geheugen en `10Gi` tijdelijke opslag
 aan, met limieten van `2000m`, `8Gi` en `30Gi`. ORT krijgt de helft van het
