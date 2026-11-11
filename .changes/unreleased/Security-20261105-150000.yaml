@@ -1,0 +1,3 @@
+kind: Security
+body: Werk het ORT-image bij van 92.4.0 naar 97.3.0 (vastgezet op digest), met een Ubuntu-basis waarin `libbrotli1` de fix voor CVE-2026-111497 bevat.
+time: 2026-11-05T15:00:00+01:00
