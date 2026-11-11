@@ -195,6 +195,14 @@ De belangrijkste controllerwaarden zijn:
 | `ORT_WORKER_CPU_REQUEST` / `ORT_WORKER_CPU_LIMIT` | `200m` / `2000m` |
 | `ORT_WORKER_MEMORY_REQUEST` / `ORT_WORKER_MEMORY_LIMIT` | `4Gi` / `8Gi` |
 | `ORT_WORKER_EPHEMERAL_STORAGE_REQUEST` / `ORT_WORKER_EPHEMERAL_STORAGE_LIMIT` | `10Gi` / `30Gi` |
+| `ORT_WORKER_USER_NAMESPACE` | `false` |
+| `ORT_WORKER_RUNTIME_CLASS` | leeg |
+
+Workers voeren code van gescande repositories uit. `ORT_WORKER_USER_NAMESPACE=true`
+zet `hostUsers: false` op de worker-Pods: root in de container is dan geen root
+op de node. Dat vraagt een container-runtime en kernel die user namespaces
+ondersteunen. `ORT_WORKER_RUNTIME_CLASS` kiest een `RuntimeClass` met een
+sandbox-runtime, zoals gVisor of Kata, als het cluster die aanbiedt.
 
 Zonder `ORT_RESULTS_URL` logt de leveringsstap alleen de uitkomst; de submission
 verdwijnt met de Pod. Een productie-inrichting vereist daarom eerst een

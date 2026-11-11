@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 )
 
@@ -78,6 +79,13 @@ type WorkerSettings struct {
 	MemoryLimit             string
 	EphemeralStorageRequest string
 	EphemeralStorageLimit   string
+	// UserNamespace runs worker Pods in their own user namespace (hostUsers:
+	// false), so root in a container is not root on the node. The node needs
+	// a container runtime and kernel that support it.
+	UserNamespace bool
+	// RuntimeClassName selects a sandboxed runtime (for example gVisor or Kata)
+	// for worker Pods, if the cluster offers one.
+	RuntimeClassName string
 }
 
 type workerQuantities struct {
@@ -89,7 +97,20 @@ func (settings WorkerSettings) Validate() error {
 	return err
 }
 
+func (settings WorkerSettings) validateIsolation() error {
+	if settings.RuntimeClassName == "" {
+		return nil
+	}
+	if problems := validation.IsDNS1123Subdomain(settings.RuntimeClassName); len(problems) > 0 {
+		return fmt.Errorf("invalid worker runtime class %q: %s", settings.RuntimeClassName, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
 func (settings WorkerSettings) quantities() (workerQuantities, error) {
+	if err := settings.validateIsolation(); err != nil {
+		return workerQuantities{}, err
+	}
 	if settings.Parallelism < 1 || settings.Parallelism > 100 {
 		return workerQuantities{}, fmt.Errorf("parallelism must be between 1 and 100")
 	}
@@ -286,6 +307,12 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 				},
 			},
 		},
+	}
+	if resources.Settings.UserNamespace {
+		job.Spec.Template.Spec.HostUsers = ptr.To(false)
+	}
+	if resources.Settings.RuntimeClassName != "" {
+		job.Spec.Template.Spec.RuntimeClassName = ptr.To(resources.Settings.RuntimeClassName)
 	}
 	job.Annotations = map[string]string{specHashAnnotation: jobSpecHash(job.Spec)}
 	return job, nil

@@ -48,6 +48,8 @@ func TestControllerCommandRejectsInvalidSettingsAndArguments(t *testing.T) {
 		{name: "parallelism", variable: "ORT_PARALLELISM", value: "101"},
 		{name: "deadline", variable: "ORT_BATCH_DEADLINE", value: "-1h"},
 		{name: "storage", variable: "ORT_WORKER_EPHEMERAL_STORAGE_LIMIT", value: "lots"},
+		{name: "user namespace", variable: "ORT_WORKER_USER_NAMESPACE", value: "sometimes"},
+		{name: "runtime class", variable: "ORT_WORKER_RUNTIME_CLASS", value: "Not_A_Name"},
 		{name: "arguments", args: []string{"--help"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -73,10 +75,23 @@ func setValidControllerEnv(t *testing.T) {
 
 func clearControllerEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"POD_NAMESPACE", "POD_NAME", "ORT_BATCH_ID", "ORT_REPOSITORIES_URL", "ORT_RESULTS_URL", "ORT_CONFIG_DIR", "ORT_PARALLELISM", "ORT_BATCH_DEADLINE", "ORT_WORKER_CPU_REQUEST", "ORT_WORKER_CPU_LIMIT", "ORT_WORKER_MEMORY_REQUEST", "ORT_WORKER_MEMORY_LIMIT", "ORT_WORKER_EPHEMERAL_STORAGE_REQUEST", "ORT_WORKER_EPHEMERAL_STORAGE_LIMIT", "ORT_REGISTER_API_KEY"} {
+	for _, name := range []string{"POD_NAMESPACE", "POD_NAME", "ORT_BATCH_ID", "ORT_REPOSITORIES_URL", "ORT_RESULTS_URL", "ORT_CONFIG_DIR", "ORT_PARALLELISM", "ORT_BATCH_DEADLINE", "ORT_WORKER_CPU_REQUEST", "ORT_WORKER_CPU_LIMIT", "ORT_WORKER_MEMORY_REQUEST", "ORT_WORKER_MEMORY_LIMIT", "ORT_WORKER_EPHEMERAL_STORAGE_REQUEST", "ORT_WORKER_EPHEMERAL_STORAGE_LIMIT", "ORT_WORKER_USER_NAMESPACE", "ORT_WORKER_RUNTIME_CLASS", "ORT_REGISTER_API_KEY"} {
 		t.Setenv(name, "")
 	}
 	clearAuthEnv(t)
+}
+
+func TestControllerConfigReadsWorkerIsolation(t *testing.T) {
+	setValidControllerEnv(t)
+	t.Setenv("ORT_WORKER_USER_NAMESPACE", "true")
+	t.Setenv("ORT_WORKER_RUNTIME_CLASS", "gvisor")
+	cfg, err := loadControllerConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings := cfg.Orchestration.Settings; !settings.UserNamespace || settings.RuntimeClassName != "gvisor" {
+		t.Fatalf("settings=%+v", settings)
+	}
 }
 
 func TestControllerConfigReportsAllProblemsAtOnce(t *testing.T) {
