@@ -15,6 +15,8 @@ import (
 
 // This test exercises the actual ORT image and the separately versioned baseline rules.
 // The fixture has no dependencies: networked vulnerability coverage needs its own test repositories.
+// It has no GitHub Actions workflow either: since ORT 97 the GitHubAction analyzer fails on a
+// repository cloned from a local path, which this test needs; remote repositories are not affected.
 func TestContainerBaseline(t *testing.T) {
 	config := os.Getenv("ORT_RUNNER_TEST_CONFIG_DIR")
 	if config == "" {
@@ -32,19 +34,18 @@ func TestContainerBaseline(t *testing.T) {
 		t.Run(fmt.Sprintf("security_present_%t", securityPresent), func(t *testing.T) {
 			root := t.TempDir()
 			repo, output := filepath.Join(root, "repo"), filepath.Join(root, "output")
-			for _, dir := range []string{filepath.Join(repo, ".github", "workflows"), output} {
+			for _, dir := range []string{repo, output} {
 				if err := os.MkdirAll(dir, 0755); err != nil {
 					t.Fatal(err)
 				}
 			}
 			files := map[string]string{
-				"README.md":                "# ORT runner integration fixture\n",
-				"LICENSE":                  "SPDX-License-Identifier: MIT\n",
-				"publiccode.yml":           "publiccodeYmlVersion: '0.5'\nname: ort-runner-fixture\n",
-				"CONTRIBUTING.md":          "# Contributing\n",
-				"CODE_OF_CONDUCT.md":       "# Code of conduct\n",
-				"CHANGELOG":                "Initial fixture.\n",
-				".github/workflows/ci.yml": "name: Fixture\non: workflow_dispatch\njobs: {}\n",
+				"README.md":          "# ORT runner integration fixture\n",
+				"LICENSE":            "SPDX-License-Identifier: MIT\n",
+				"publiccode.yml":     "publiccodeYmlVersion: '0.5'\nname: ort-runner-fixture\n",
+				"CONTRIBUTING.md":    "# Contributing\n",
+				"CODE_OF_CONDUCT.md": "# Code of conduct\n",
+				"CHANGELOG":          "Initial fixture.\n",
 			}
 			if securityPresent {
 				files["SECURITY.md"] = "# Reporting a vulnerability\n"
