@@ -262,3 +262,39 @@ func TestJobSpecHashIgnoresDeadlineOnly(t *testing.T) {
 		t.Fatal("image did not change the spec hash")
 	}
 }
+
+func TestOptionalConfigFilesAreMountedOnlyWhenPresent(t *testing.T) {
+	for _, test := range []struct {
+		file string
+		set  func(*WorkerResources, []byte)
+	}{
+		{rulesManifestFile, func(r *WorkerResources, data []byte) { r.RulesManifest = data }},
+		{ortConfigFile, func(r *WorkerResources, data []byte) { r.ORTConfig = data }},
+	} {
+		for _, content := range []string{"", "key: value\n"} {
+			resources := testWorkerResources(t)
+			test.set(&resources, []byte(content))
+			maps, err := BuildConfigMaps(testOwner(), "oss", resources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value, stored := maps[0].Data[test.file]
+			job, err := BuildIndexedJob(testOwner(), "oss", "scan-batch", resources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mounted := false
+			for _, volume := range job.Spec.Template.Spec.Volumes {
+				if volume.Name != rulesVolumeName {
+					continue
+				}
+				for _, item := range volume.Projected.Sources[0].ConfigMap.Items {
+					mounted = mounted || item.Path == test.file
+				}
+			}
+			if want := content != ""; stored != want || mounted != want || value != content {
+				t.Fatalf("%s %q: stored=%t mounted=%t value=%q", test.file, content, stored, mounted, value)
+			}
+		}
+	}
+}

@@ -1,0 +1,3 @@
+kind: Added
+body: Neem in `run.json` een dependency-overzicht op per projectbestand (package manager, directe en transitieve dependencies) en rapporteer onder `rules` per regel uit een optioneel `rules.yml` of die geslaagd is; een optioneel `config.yml` gaat als ORT-configuratie mee naar elke ORT-stap, bijvoorbeeld voor de Java-versie van de Gradle-analyse. Werk ORT bij naar 98.0.0 (vastgezet op digest) en `k8s.io` naar 0.37.2.
+time: 2026-10-27T13:00:00+01:00
