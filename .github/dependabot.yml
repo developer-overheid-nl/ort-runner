@@ -5,6 +5,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: gomod
     directory: /
@@ -19,3 +24,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      docker-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
