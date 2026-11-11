@@ -118,6 +118,20 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 	if _, ok := deliverEnv[register.APIKeyVariable]; ok {
 		t.Fatal("register API key passed to worker")
 	}
+	// Delivery takes the repository ID from the manifest, not from the output the scan wrote.
+	if deliverEnv["ORT_MANIFEST_DIR"].Value != "/manifest" {
+		t.Fatalf("delivery environment=%+v", deliverEnv)
+	}
+	manifestMounted := false
+	for _, mount := range deliver.VolumeMounts {
+		if !mount.ReadOnly {
+			t.Fatalf("delivery mount is writable: %+v", mount)
+		}
+		manifestMounted = manifestMounted || (mount.Name == manifestVolumeName && mount.MountPath == "/manifest")
+	}
+	if !manifestMounted {
+		t.Fatalf("delivery container lacks the manifest: %+v", deliver.VolumeMounts)
+	}
 	for _, container := range []corev1.Container{scan, deliver} {
 		if *container.SecurityContext.AllowPrivilegeEscalation || !slices.Equal(container.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) {
 			t.Fatalf("%s security context=%+v", container.Name, container.SecurityContext)

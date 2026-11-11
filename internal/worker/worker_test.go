@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -172,13 +173,77 @@ func TestDeliverFailsAfterRetries(t *testing.T) {
 }
 
 func TestDeliverRejectsMissingSubmission(t *testing.T) {
-	cfg := DeliverConfig{BatchID: "batch-1", OutputDir: t.TempDir()}
+	cfg := deliverConfig(t, "")
+	if err := os.Remove(filepath.Join(cfg.OutputDir, submissionFile)); err != nil {
+		t.Fatal(err)
+	}
 	if err := Deliver(context.Background(), cfg); err == nil {
 		t.Fatal("missing submission accepted")
 	}
 }
 
+// The scan container runs code from the scanned repository and can write the
+// shared output directory, so the submission must not decide which repository
+// a result belongs to.
+func TestDeliverRejectsSubmissionForOtherRepository(t *testing.T) {
+	posted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posted = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	cfg := deliverConfig(t, server.URL)
+	writeSubmission(t, cfg.OutputDir, runner.Submission{SchemaVersion: 1, RepositoryID: "repo-b", Scan: runner.Report{Status: "completed"}})
+	if err := Deliver(context.Background(), cfg); err == nil || posted {
+		t.Fatalf("submission for another repository delivered: posted=%t err=%v", posted, err)
+	}
+}
+
+func TestDeliverRejectsInvalidManifestSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*DeliverConfig)
+	}{
+		{name: "negative index", mutate: func(cfg *DeliverConfig) { cfg.CompletionIndex = -1 }},
+		{name: "out of range", mutate: func(cfg *DeliverConfig) { cfg.CompletionIndex = 1 }},
+		{name: "batch mismatch", mutate: func(cfg *DeliverConfig) { cfg.BatchID = "other" }},
+		{name: "missing manifest", mutate: func(cfg *DeliverConfig) { cfg.ManifestDir = t.TempDir() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := deliverConfig(t, "")
+			tc.mutate(&cfg)
+			if err := Deliver(context.Background(), cfg); err == nil {
+				t.Fatal("invalid manifest selection accepted")
+			}
+		})
+	}
+}
+
+func TestDeliverRejectsOversizedSubmission(t *testing.T) {
+	cfg := deliverConfig(t, "")
+	// Valid JSON padded with whitespace, so only the size can reject it.
+	data, err := json.Marshal(runner.Submission{SchemaVersion: 1, RepositoryID: "repo-a", Scan: runner.Report{Status: "completed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, bytes.Repeat([]byte(" "), maxSubmissionBytes+1-len(data))...)
+	if err := os.WriteFile(filepath.Join(cfg.OutputDir, submissionFile), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Deliver(context.Background(), cfg); err == nil {
+		t.Fatal("oversized submission accepted")
+	}
+}
+
 func scanConfig(t *testing.T) ScanConfig {
+	t.Helper()
+	return ScanConfig{
+		BatchID: "batch-1", ManifestDir: writeManifest(t), Timeout: time.Minute,
+		Runner: runner.Config{OutputDir: t.TempDir(), ConfigDir: t.TempDir(), StageTimeout: time.Minute},
+	}
+}
+
+func writeManifest(t *testing.T) string {
 	t.Helper()
 	manifestDir := t.TempDir()
 	manifest, err := orchestration.NewManifest("batch-1", []register.Repository{{ID: "repo-a", URL: "https://example.test/a.git"}})
@@ -195,26 +260,28 @@ func scanConfig(t *testing.T) ScanConfig {
 			t.Fatal(err)
 		}
 	}
-	return ScanConfig{
-		BatchID: "batch-1", ManifestDir: manifestDir, Timeout: time.Minute,
-		Runner: runner.Config{OutputDir: t.TempDir(), ConfigDir: t.TempDir(), StageTimeout: time.Minute},
-	}
+	return manifestDir
 }
 
 func deliverConfig(t *testing.T, resultsURL string) DeliverConfig {
 	t.Helper()
 	outputDir := t.TempDir()
-	data, err := json.Marshal(runner.Submission{SchemaVersion: 1, RepositoryID: "repo-a", Scan: runner.Report{Status: "completed"}})
+	writeSubmission(t, outputDir, runner.Submission{SchemaVersion: 1, RepositoryID: "repo-a", Scan: runner.Report{Status: "completed"}})
+	return DeliverConfig{
+		BatchID: "batch-1", CompletionIndex: 0, ManifestDir: writeManifest(t), OutputDir: outputDir, ResultsURL: resultsURL,
+		Client: register.Client{HTTP: http.DefaultClient},
+		sleep:  func(context.Context, time.Duration) error { t.Fatal("unexpected retry"); return nil },
+	}
+}
+
+func writeSubmission(t *testing.T, outputDir string, submission runner.Submission) {
+	t.Helper()
+	data, err := json.Marshal(submission)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(outputDir, submissionFile), data, 0600); err != nil {
 		t.Fatal(err)
-	}
-	return DeliverConfig{
-		BatchID: "batch-1", OutputDir: outputDir, ResultsURL: resultsURL,
-		Client: register.Client{HTTP: http.DefaultClient},
-		sleep:  func(context.Context, time.Duration) error { t.Fatal("unexpected retry"); return nil },
 	}
 }
 
