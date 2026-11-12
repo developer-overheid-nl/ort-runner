@@ -168,6 +168,81 @@ func TestRunControllerReportsTerminalFailedIndex(t *testing.T) {
 	}
 }
 
+func TestRunControllerDeliversCompletedIndexesFromTheirOwnDirectory(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}, {ID: "b", URL: "https://example.test/b.git"}, {ID: "c", URL: "https://example.test/c.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	finishJobs(t, client, jobResult{completed: "0,2", failed: "1", reason: batchv1.JobReasonFailedIndexes})
+	deliverer := &recordingDeliverer{}
+	cfg := controllerConfig(t, server.URL)
+	cfg.ResultDeliverer = deliverer
+	batchDir := filepath.Join(cfg.ResultsDir, "controller-uid")
+	if err := os.MkdirAll(filepath.Join(batchDir, "round-0", "0"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := RunController(context.Background(), client, cfg)
+	if err != nil || summary.Completed != 2 || summary.Failed != 1 {
+		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+	want := map[string]string{"a": filepath.Join(batchDir, "round-0", "0"), "c": filepath.Join(batchDir, "round-0", "2")}
+	if len(deliverer.delivered) != len(want) || deliverer.delivered["a"] != want["a"] || deliverer.delivered["c"] != want["c"] {
+		t.Fatalf("delivered=%v want=%v", deliverer.delivered, want)
+	}
+	if _, err := os.Stat(batchDir); !os.IsNotExist(err) {
+		t.Fatalf("results of a finished batch are kept: %v", err)
+	}
+}
+
+// A completed index whose result cannot be delivered, for example because the
+// submission is for another repository, counts as failed and is reported.
+func TestRunControllerReportsUndeliverableResultAsFailed(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}, {ID: "b", URL: "https://example.test/b.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	finishJobs(t, client, jobResult{completed: "0-1"})
+	reporter := &recordingFailureReporter{}
+	cfg := controllerConfig(t, server.URL)
+	cfg.ResultDeliverer = &recordingDeliverer{fail: map[string]bool{"b": true}}
+	cfg.ResultsURL = "https://example.test/results"
+	cfg.FailureReporter = reporter
+
+	summary, err := RunController(context.Background(), client, cfg)
+	if err != nil || summary.Completed != 1 || summary.Failed != 1 || !slices.Equal(summary.FailedRepositoryIDs, []string{"b"}) {
+		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+	if !slices.Equal(reporter.repositories, []string{"b"}) {
+		t.Fatalf("reported=%v", reporter.repositories)
+	}
+}
+
+func TestRunControllerUsesTheControllerResultsClaim(t *testing.T) {
+	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}}
+	server := repositoryServer(t, repositories)
+	defer server.Close()
+	client := fake.NewSimpleClientset(controllerPod())
+	finishJobs(t, client, jobResult{completed: "0"})
+	if _, err := RunController(context.Background(), client, controllerConfig(t, server.URL)); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := client.BatchV1().Jobs("oss").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(jobs.Items) != 1 {
+		t.Fatalf("jobs=%d err=%v", len(jobs.Items), err)
+	}
+	pod := jobs.Items[0].Spec.Template.Spec
+	claim := ""
+	for _, volume := range pod.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			claim = volume.PersistentVolumeClaim.ClaimName
+		}
+	}
+	if claim != "ort-results" || environment(pod.Containers[0])["ORT_RESULTS_PREFIX"].Value != "controller-uid/round-0" {
+		t.Fatalf("claim=%q env=%+v", claim, pod.Containers[0].Env)
+	}
+}
+
 func TestRunControllerRestartKeepsStoredManifestWhenRegisterChanges(t *testing.T) {
 	requests := 0
 	repositories := []register.Repository{{ID: "a", URL: "https://example.test/a.git"}}
@@ -445,6 +520,10 @@ func TestRunControllerRejectsInvalidControllerPod(t *testing.T) {
 	}{
 		{name: "no job owner", mutate: func(pod *corev1.Pod) { pod.OwnerReferences = nil }},
 		{name: "runner container missing", mutate: func(pod *corev1.Pod) { pod.Spec.Containers[0].Name = "other" }},
+		{name: "results not mounted", mutate: func(pod *corev1.Pod) { pod.Spec.Containers[0].VolumeMounts = nil }},
+		{name: "results not a claim", mutate: func(pod *corev1.Pod) {
+			pod.Spec.Volumes[0].VolumeSource = corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := controllerPod()
@@ -454,6 +533,27 @@ func TestRunControllerRejectsInvalidControllerPod(t *testing.T) {
 			}
 		})
 	}
+}
+
+// recordingDeliverer records which repository the controller delivered from
+// which result directory, and fails for the repositories in fail.
+type recordingDeliverer struct {
+	mu        sync.Mutex
+	delivered map[string]string
+	fail      map[string]bool
+}
+
+func (d *recordingDeliverer) DeliverResult(_ context.Context, _ string, repository register.Repository, dir string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.delivered == nil {
+		d.delivered = map[string]string{}
+	}
+	d.delivered[repository.ID] = dir
+	if d.fail[repository.ID] {
+		return errors.New("delivery failed")
+	}
+	return nil
 }
 
 type recordingFailureReporter struct {
@@ -472,8 +572,11 @@ func controllerPod() *corev1.Pod {
 	controller := true
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "controller-pod", Namespace: "oss", OwnerReferences: []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: "controller-job", UID: "controller-uid", Controller: &controller}}},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "results", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "ort-results"}},
+		}}, Containers: []corev1.Container{{
 			Name: "ort-runner", Image: "ghcr.io/example/ort-runner@sha256:1234",
+			VolumeMounts: []corev1.VolumeMount{{Name: "results", MountPath: "/results"}},
 			Env: []corev1.EnvVar{
 				{Name: "ORT_RESULTS_URL", Value: "https://example.test/results"},
 				{Name: "AUTH_CLIENT_ID", Value: "runner"},
@@ -494,6 +597,8 @@ func controllerConfig(t *testing.T, repositoriesURL string) ControllerConfig {
 		Namespace: "oss", PodName: "controller-pod", ContainerName: "ort-runner", BatchName: "batch-1",
 		RepositoriesURL: repositoriesURL, ConfigDir: configDir, Settings: testSettings(),
 		RegisterClient: register.Client{HTTP: http.DefaultClient},
+		// The controller Pod mounts the results claim at /results; tests use a temporary directory instead.
+		ResultsMountPath: "/results", ResultsDir: t.TempDir(), ResultDeliverer: &recordingDeliverer{},
 	}
 }
 

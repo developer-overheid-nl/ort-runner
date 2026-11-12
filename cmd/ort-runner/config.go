@@ -129,6 +129,9 @@ func loadControllerConfig() (controllerConfig, error) {
 			Auth:    e.auth(),
 		},
 	}
+	resultsDir := e.required("ORT_RESULTS_DIR")
+	cfg.Orchestration.ResultsMountPath = resultsDir
+	cfg.Orchestration.ResultsDir = resultsDir
 	if err := e.err(); err != nil {
 		return cfg, err
 	}
@@ -162,24 +165,4 @@ func (e *env) completionIndex() int {
 		e.errs = append(e.errs, errors.New("JOB_COMPLETION_INDEX must be a non-negative integer"))
 	}
 	return index
-}
-
-type deliverConfig struct {
-	Worker worker.DeliverConfig
-	HTTP   httpSettings
-}
-
-func loadDeliverConfig() (deliverConfig, error) {
-	var e env
-	cfg := deliverConfig{
-		Worker: worker.DeliverConfig{
-			BatchID:         e.required("ORT_BATCH_ID"),
-			CompletionIndex: e.completionIndex(),
-			ManifestDir:     e.required("ORT_MANIFEST_DIR"),
-			OutputDir:       e.string("ORT_OUTPUT_DIR", "/output"),
-			ResultsURL:      os.Getenv(register.ResultsURLVariable),
-		},
-		HTTP: httpSettings{Timeout: e.duration("ORT_HTTP_TIMEOUT", 30*time.Second), Auth: e.auth()},
-	}
-	return cfg, e.err()
 }

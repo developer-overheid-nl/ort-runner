@@ -1,6 +1,7 @@
-// Package worker runs one repository of an Indexed Job. Scanning and delivery
-// are separate steps in separate containers, so code that is executed while
-// scanning a repository never shares a process or environment with the result
+// Package worker runs one repository of an Indexed Job and delivers its result.
+// The scan runs in a worker Pod without any credentials and writes its result to
+// a shared volume; the controller delivers it afterwards. Code that is executed
+// while scanning a repository therefore never shares a Pod with the result
 // credentials.
 package worker
 
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/developer-overheid-nl/ort-runner/internal/orchestration"
@@ -26,8 +28,8 @@ import (
 
 const submissionFile = "submission.json"
 
-// maxSubmissionBytes bounds the submission that delivery reads from the output
-// directory, which the scan container can write.
+// maxSubmissionBytes bounds the submission that delivery reads from the result
+// directory, which the scan can write.
 const maxSubmissionBytes = 16 << 20
 
 var chunkNamePattern = regexp.MustCompile(`^chunk-([0-9]{4})-([0-9a-f]{64})\.json$`)
@@ -48,12 +50,14 @@ type ScanConfig struct {
 }
 
 type DeliverConfig struct {
-	BatchID         string
-	CompletionIndex int
-	ManifestDir     string
-	OutputDir       string
-	ResultsURL      string
-	Client          register.Client
+	BatchID string
+	// Repository is the repository the controller assigned to this worker; the
+	// submission must be for this repository.
+	Repository register.Repository
+	// Dir is the result directory of one worker on the shared volume.
+	Dir        string
+	ResultsURL string
+	Client     register.Client
 
 	sleep func(context.Context, time.Duration) error
 }
@@ -126,29 +130,18 @@ func Scan(ctx context.Context, cfg ScanConfig) (runner.Submission, error) {
 	return submission, nil
 }
 
-// Deliver posts the submission written by Scan. Without a result endpoint it
-// only logs the outcome.
+// Deliver posts the submission that Scan wrote to cfg.Dir. Without a result
+// endpoint it only logs the outcome.
 //
-// The scan container runs code from the scanned repository and can write the
-// output directory. The repository a result belongs to therefore comes from the
-// read-only manifest and the completion index, never from the submission file;
-// a submission for another repository is not delivered.
+// The scan runs code from the scanned repository and controls the result
+// directory. The repository a result belongs to therefore comes from the
+// controller, never from the submission file; a submission for another
+// repository is not delivered, and links are not followed.
 func Deliver(ctx context.Context, cfg DeliverConfig) error {
-	if cfg.BatchID == "" || cfg.ManifestDir == "" || cfg.OutputDir == "" {
-		return fmt.Errorf("batch ID, manifest directory and output directory are required")
+	if cfg.BatchID == "" || cfg.Repository.ID == "" || cfg.Dir == "" {
+		return fmt.Errorf("batch ID, repository and result directory are required")
 	}
-	manifest, err := readManifest(cfg.ManifestDir)
-	if err != nil {
-		return err
-	}
-	if manifest.BatchID != cfg.BatchID {
-		return fmt.Errorf("manifest batch ID %q does not match %q", manifest.BatchID, cfg.BatchID)
-	}
-	repository, err := manifest.Repository(cfg.CompletionIndex)
-	if err != nil {
-		return err
-	}
-	data, err := readSubmissionFile(filepath.Join(cfg.OutputDir, submissionFile))
+	data, err := readSubmissionFile(cfg.Dir)
 	if err != nil {
 		return err
 	}
@@ -156,8 +149,8 @@ func Deliver(ctx context.Context, cfg DeliverConfig) error {
 	if err := json.Unmarshal(data, &submission); err != nil {
 		return fmt.Errorf("decode submission: %w", err)
 	}
-	if submission.RepositoryID != repository.ID {
-		return fmt.Errorf("submission is for repository %q, completion index %d is repository %q", submission.RepositoryID, cfg.CompletionIndex, repository.ID)
+	if submission.RepositoryID != cfg.Repository.ID {
+		return fmt.Errorf("submission is for repository %q, expected %q", submission.RepositoryID, cfg.Repository.ID)
 	}
 	if cfg.ResultsURL == "" {
 		slog.Info("Result delivery not configured", "batch_id", cfg.BatchID, "repository_id", submission.RepositoryID, "scan_status", submission.Scan.Status)
@@ -184,12 +177,29 @@ func Deliver(ctx context.Context, cfg DeliverConfig) error {
 	}
 }
 
-func readSubmissionFile(path string) ([]byte, error) {
-	file, err := os.Open(path)
+// readSubmissionFile reads the submission in dir without following links: the
+// directory and the file must be what they claim to be.
+func readSubmissionFile(dir string) ([]byte, error) {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read result directory: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("result directory %s is not a directory", dir)
+	}
+	path := filepath.Join(dir, submissionFile)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("read submission: %w", err)
 	}
 	defer func() { _ = file.Close() }()
+	info, err = file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("read submission: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("submission %s is not a regular file", path)
+	}
 	data, err := io.ReadAll(io.LimitReader(file, maxSubmissionBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read submission: %w", err)
