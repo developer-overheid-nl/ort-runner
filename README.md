@@ -13,7 +13,7 @@ repositories achter elkaar.
 In Kubernetes start een geplande controller één Indexed Job. Iedere worker-Pod
 verwerkt precies één repository. Daardoor kan een zwaar project alleen zijn eigen
 worker laten mislukken en begint een herstart van de controller niet opnieuw bij
-repository één. `controller`, `worker` en `deliver` zijn interne
+repository één. `controller` en `worker` zijn interne
 deploymentcommando's; lokaal start je de runner met `go run ./cmd/ort-runner` en
 blijven `--repository` en `--repositories-url` de ingangen.
 
@@ -127,8 +127,9 @@ Een mislukte POST maakt de lokale, sequentiële batch onvolledig, bewaart het be
 en stopt de overige scans niet. Deze modus doet geen automatische POST-retries. Een
 volgende batch scant opnieuw; bewaarde berichten worden niet automatisch opnieuw
 verstuurd. Een fout bij het ophalen van de lijst stopt de batch voordat er scans
-starten. Kubernetes-workers gebruiken een vaste idempotency-key en proberen alleen
-de POST maximaal vijf keer; de scan zelf wordt daarbij niet herhaald.
+starten. In Kubernetes levert de controller af met een vaste idempotency-key en
+probeert hij alleen de POST maximaal vijf keer; de scan zelf wordt daarbij niet
+herhaald.
 
 ## Kubernetes-uitvoering
 
@@ -139,17 +140,25 @@ controller gebruikt die opgeslagen lijst, ook als het register intussen is
 gewijzigd. Kubernetes bewaart de voortgang in de Indexed Job; er is geen aparte
 database of queue.
 
-Een worker-Pod heeft twee stappen:
+Scannen en afleveren zijn gescheiden:
 
-1. **Scan** (`ort-runner worker`, init-container): checkout en ORT. Deze stap voert
-   code van de gescande repository uit en krijgt daarom geen credentials,
-   ServiceAccount-token of service-links.
-2. **Levering** (`ort-runner deliver`, kleine container): stuurt `submission.json`
-   met een vaste idempotency-key (`ort:<sha256>`) naar `ORT_RESULTS_URL` en probeert
-   dat maximaal vijf keer. Alleen deze stap krijgt de OAuth-gegevens. De scan kan
-   `submission.json` aanpassen, dus de levering bepaalt de repository zelf uit het
-   read-only manifest en `JOB_COMPLETION_INDEX`. Een submission voor een andere
-   repository, of een bestand groter dan 16 MiB, wordt niet verstuurd.
+1. **Scan** (`ort-runner worker`, de enige container van de worker-Pod): checkout
+   en ORT. Deze stap voert code van de gescande repository uit en krijgt daarom
+   geen credentials, ServiceAccount-token of service-links. Het resultaat
+   (`submission.json`) komt op een gedeeld volume (ReadWriteMany-PVC). Elke
+   worker ziet daarvan alleen zijn eigen map
+   (`<controller-Job-UID>/round-<n>/<JOB_COMPLETION_INDEX>`, via `subPathExpr`).
+2. **Levering** (controller): na elke ronde leest de controller per afgeronde
+   repository `submission.json` en stuurt die met een vaste idempotency-key
+   (`ort:<sha256>`) naar `ORT_RESULTS_URL`, met maximaal vijf pogingen. Alleen de
+   controller heeft de OAuth-gegevens. Een worker bepaalt de inhoud van zijn map,
+   dus de controller neemt de repository uit zijn eigen manifest, volgt geen
+   symlinks en weigert een submission voor een andere repository of groter dan
+   16 MiB. Zo'n repository geldt als mislukt. De resultaten blijven staan tot de
+   batch klaar is, zodat een herstarte controller opnieuw kan afleveren.
+
+De controller vindt het volume via zijn eigen Pod-spec: de PersistentVolumeClaim
+die hij op `ORT_RESULTS_DIR` mount, geven de workers ook mee.
 
 De scan vraagt standaard `200m` CPU, `4Gi` geheugen en `10Gi` tijdelijke opslag
 aan, met limieten van `2000m`, `8Gi` en `30Gi`. ORT krijgt de helft van het
@@ -192,6 +201,7 @@ De belangrijkste controllerwaarden zijn:
 
 | Omgevingsvariabele | Standaard |
 | --- | --- |
+| `ORT_RESULTS_DIR` | verplicht; mountpunt van de resultaten-PVC in de controller |
 | `ORT_PARALLELISM` | `10` |
 | `ORT_BATCH_DEADLINE` | `46h` |
 | `ORT_REPOSITORY_TIMEOUT` | `10m` |
@@ -199,8 +209,8 @@ De belangrijkste controllerwaarden zijn:
 | `ORT_WORKER_MEMORY_REQUEST` / `ORT_WORKER_MEMORY_LIMIT` | `4Gi` / `8Gi` |
 | `ORT_WORKER_EPHEMERAL_STORAGE_REQUEST` / `ORT_WORKER_EPHEMERAL_STORAGE_LIMIT` | `10Gi` / `30Gi` |
 
-Zonder `ORT_RESULTS_URL` logt de leveringsstap alleen de uitkomst; de submission
-verdwijnt met de Pod. Een productie-inrichting vereist daarom eerst een
+Zonder `ORT_RESULTS_URL` logt de controller alleen de uitkomst; de submission
+verdwijnt met de batch. Een productie-inrichting vereist daarom eerst een
 resultaatendpoint.
 
 ## Eén repository testen
