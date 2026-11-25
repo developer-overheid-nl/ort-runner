@@ -35,6 +35,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return executeController(ctx, args[1:], stdout, stderr)
 		case "worker":
 			return executeWorker(ctx, args[1:], stdout, stderr)
+		case "deliver":
+			return executeDeliver(ctx, args[1:], stdout, stderr)
 		}
 	}
 	return executeLocal(ctx, args, stdout, stderr)

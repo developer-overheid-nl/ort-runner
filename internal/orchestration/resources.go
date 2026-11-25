@@ -5,16 +5,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/developer-overheid-nl/ort-runner/internal/register"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 )
 
@@ -32,8 +31,7 @@ const (
 	gradleVolumeName     = "gradle"
 	outputVolumeName     = "output"
 	scanContainerName    = "scan"
-	// Kubernetes sets this variable in every container of an Indexed Job Pod.
-	completionIndexVariable = "JOB_COMPLETION_INDEX"
+	deliverContainerName = "deliver"
 
 	// The tenant admission policy allows a Job backoffLimit of at most 10. It
 	// counts failed Pods across all indexes; when a round reaches it, the
@@ -60,12 +58,9 @@ type WorkerResources struct {
 	RulesManifest   []byte // rules.yml; optional
 	ORTConfig       []byte // config.yml; optional
 	ManifestChunks  []Chunk
-	// ResultsClaim is the shared volume the workers write their results to;
-	// ResultsPrefix is the directory of this round on it. Each worker sees only
-	// <ResultsPrefix>/<completion index>.
-	ResultsClaim  string
-	ResultsPrefix string
-	Settings      WorkerSettings
+	// ResultEnvironment is passed only to the delivery container; see ResultEnvironment.
+	ResultEnvironment []corev1.EnvVar
+	Settings          WorkerSettings
 	// Round numbers the worker Jobs of one batch; RoundDeadline is the time left
 	// in the batch when the round starts.
 	Round         int
@@ -83,13 +78,6 @@ type WorkerSettings struct {
 	MemoryLimit             string
 	EphemeralStorageRequest string
 	EphemeralStorageLimit   string
-	// UserNamespace runs worker Pods in their own user namespace (hostUsers:
-	// false), so root in a container is not root on the node. The node needs
-	// a container runtime and kernel that support it.
-	UserNamespace bool
-	// RuntimeClassName selects a sandboxed runtime (for example gVisor or Kata)
-	// for worker Pods, if the cluster offers one.
-	RuntimeClassName string
 }
 
 type workerQuantities struct {
@@ -101,20 +89,7 @@ func (settings WorkerSettings) Validate() error {
 	return err
 }
 
-func (settings WorkerSettings) validateIsolation() error {
-	if settings.RuntimeClassName == "" {
-		return nil
-	}
-	if problems := validation.IsDNS1123Subdomain(settings.RuntimeClassName); len(problems) > 0 {
-		return fmt.Errorf("invalid worker runtime class %q: %s", settings.RuntimeClassName, strings.Join(problems, "; "))
-	}
-	return nil
-}
-
 func (settings WorkerSettings) quantities() (workerQuantities, error) {
-	if err := settings.validateIsolation(); err != nil {
-		return workerQuantities{}, err
-	}
 	if settings.Parallelism < 1 || settings.Parallelism > 100 {
 		return workerQuantities{}, fmt.Errorf("parallelism must be between 1 and 100")
 	}
@@ -149,6 +124,22 @@ func (settings WorkerSettings) quantities() (workerQuantities, error) {
 		field.list[field.name] = quantity
 	}
 	return result, nil
+}
+
+// ResultEnvironment selects the controller variables that the delivery
+// container needs. Credentials are only passed on when a result endpoint is set.
+func ResultEnvironment(environment []corev1.EnvVar) []corev1.EnvVar {
+	enabled := slices.ContainsFunc(environment, func(variable corev1.EnvVar) bool {
+		return variable.Name == register.ResultsURLVariable && (variable.Value != "" || variable.ValueFrom != nil)
+	})
+	result := make([]corev1.EnvVar, 0, len(environment))
+	for _, variable := range environment {
+		isCredential := slices.Contains(register.ResultCredentialVariables, variable.Name)
+		if variable.Name == register.ResultsURLVariable || enabled && isCredential {
+			result = append(result, *variable.DeepCopy())
+		}
+	}
+	return result
 }
 
 func BuildConfigMaps(owner metav1.OwnerReference, namespace string, resources WorkerResources) ([]*corev1.ConfigMap, error) {
@@ -191,20 +182,14 @@ func BuildConfigMaps(owner metav1.OwnerReference, namespace string, resources Wo
 	return maps, nil
 }
 
-// BuildIndexedJob creates one Pod per repository. The Pod runs the scan without
-// any credentials and writes the result to its own directory on the shared
-// results volume; the controller delivers it.
+// BuildIndexedJob creates one Pod per repository. The scan runs as an init
+// container without any credentials; only the small delivery container that
+// runs afterwards receives the result credentials.
 func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resources WorkerResources) (*batchv1.Job, error) {
 	if name == "" {
 		return nil, fmt.Errorf("job name is required")
 	}
 	if err := validateResources(owner, namespace, resources); err != nil {
-		return nil, err
-	}
-	if resources.ResultsClaim == "" {
-		return nil, fmt.Errorf("a results volume claim is required")
-	}
-	if err := validateResultsPrefix(resources.ResultsPrefix); err != nil {
 		return nil, err
 	}
 	quantities, err := resources.Settings.quantities()
@@ -225,29 +210,37 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 			corev1.KeyToPath{Key: manifestChunkKey, Path: fmt.Sprintf("chunk-%04d-%s.json", chunk.Index, chunk.Digest)}))
 	}
 
+	batch := []corev1.EnvVar{{Name: "ORT_BATCH_ID", Value: resources.BatchID}, {Name: "ORT_OUTPUT_DIR", Value: "/output"}}
 	scan := corev1.Container{
 		Name:    scanContainerName,
 		Image:   resources.Image,
 		Command: []string{"ort-runner", "worker"},
-		Env: []corev1.EnvVar{
-			{Name: "ORT_BATCH_ID", Value: resources.BatchID},
-			{Name: "ORT_OUTPUT_DIR", Value: "/output"},
-			{Name: "ORT_RESULTS_PREFIX", Value: resources.ResultsPrefix},
-			{Name: "ORT_MANIFEST_DIR", Value: "/manifest"},
-			{Name: "ORT_CONFIG_DIR", Value: "/config"},
-			{Name: "ORT_OPTS", Value: ortJavaOptions},
-			{Name: "ORT_REPOSITORY_TIMEOUT", Value: resources.Settings.RepositoryTimeout.String()},
-		},
+		Env: append(slices.Clone(batch),
+			corev1.EnvVar{Name: "ORT_MANIFEST_DIR", Value: "/manifest"},
+			corev1.EnvVar{Name: "ORT_CONFIG_DIR", Value: "/config"},
+			corev1.EnvVar{Name: "ORT_OPTS", Value: ortJavaOptions},
+			corev1.EnvVar{Name: "ORT_REPOSITORY_TIMEOUT", Value: resources.Settings.RepositoryTimeout.String()},
+		),
 		Resources:       corev1.ResourceRequirements{Requests: quantities.requests, Limits: quantities.limits},
 		SecurityContext: restrictedContainer(),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: rulesVolumeName, MountPath: "/config", ReadOnly: true},
 			{Name: manifestVolumeName, MountPath: "/manifest", ReadOnly: true},
 			{Name: gradleVolumeName, MountPath: "/home/ort/.gradle/gradle.properties", SubPath: "gradle.properties", ReadOnly: true},
-			// Kubernetes sets JOB_COMPLETION_INDEX in every container of an Indexed
-			// Job, so each worker only sees its own directory on the shared volume.
-			{Name: outputVolumeName, MountPath: "/output", SubPathExpr: "$(ORT_RESULTS_PREFIX)/$(" + completionIndexVariable + ")"},
+			{Name: outputVolumeName, MountPath: "/output"},
 		},
+	}
+	deliver := corev1.Container{
+		Name:    deliverContainerName,
+		Image:   resources.Image,
+		Command: []string{"ort-runner", "deliver"},
+		Env:     append(slices.Clone(batch), resources.ResultEnvironment...),
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m"), corev1.ResourceMemory: resource.MustParse("32Mi")},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
+		},
+		SecurityContext: restrictedContainer(),
+		VolumeMounts:    []corev1.VolumeMount{{Name: outputVolumeName, MountPath: "/output", ReadOnly: true}},
 	}
 
 	labels := map[string]string{
@@ -282,22 +275,17 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 						FSGroup:        ptr.To(int64(ortUser)),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Containers: []corev1.Container{scan},
+					InitContainers: []corev1.Container{scan},
+					Containers:     []corev1.Container{deliver},
 					Volumes: []corev1.Volume{
 						projectedVolume(rulesVolumeName, configMapProjection(rulesConfigMapName(owner), rulesItems...)),
 						projectedVolume(manifestVolumeName, manifestSources...),
 						projectedVolume(gradleVolumeName, configMapProjection(rulesConfigMapName(owner), corev1.KeyToPath{Key: "gradle.properties", Path: "gradle.properties"})),
-						{Name: outputVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: resources.ResultsClaim}}},
+						{Name: outputVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 					},
 				},
 			},
 		},
-	}
-	if resources.Settings.UserNamespace {
-		job.Spec.Template.Spec.HostUsers = ptr.To(false)
-	}
-	if resources.Settings.RuntimeClassName != "" {
-		job.Spec.Template.Spec.RuntimeClassName = ptr.To(resources.Settings.RuntimeClassName)
 	}
 	job.Annotations = map[string]string{specHashAnnotation: jobSpecHash(job.Spec)}
 	return job, nil
@@ -323,15 +311,6 @@ func validateResources(owner metav1.OwnerReference, namespace string, resources 
 		return fmt.Errorf("%s is required", rulesFile)
 	}
 	return resources.Settings.Validate()
-}
-
-// validateResultsPrefix accepts a relative path that stays inside the results
-// volume; the kubelet refuses other subpaths, but only once the Pod starts.
-func validateResultsPrefix(prefix string) error {
-	if prefix == "" || filepath.IsAbs(prefix) || filepath.Clean(prefix) != prefix || !filepath.IsLocal(prefix) {
-		return fmt.Errorf("results prefix %q must be a clean relative path inside the results volume", prefix)
-	}
-	return nil
 }
 
 func restrictedContainer() *corev1.SecurityContext {

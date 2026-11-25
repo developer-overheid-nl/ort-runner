@@ -33,12 +33,19 @@ func TestWorkerCommandRejectsInvalidEnvironmentAndArguments(t *testing.T) {
 	}
 }
 
-// Delivery runs in the controller; the worker Pod has no deliver step anymore.
-func TestDeliverCommandIsGone(t *testing.T) {
+func TestDeliverCommandRejectsInvalidInput(t *testing.T) {
 	clearWorkerEnv(t)
 	var output bytes.Buffer
+	if code := execute(context.Background(), []string{"deliver", "--help"}, &output, &output); code != 2 {
+		t.Fatalf("arguments accepted: exit=%d", code)
+	}
 	if code := execute(context.Background(), []string{"deliver"}, &output, &output); code != 2 {
-		t.Fatalf("deliver command still exists: exit=%d output=%s", code, output.String())
+		t.Fatalf("missing batch accepted: exit=%d", code)
+	}
+	t.Setenv("ORT_BATCH_ID", "batch-1")
+	t.Setenv("ORT_OUTPUT_DIR", t.TempDir())
+	if code := execute(context.Background(), []string{"deliver"}, &output, &output); code != 1 {
+		t.Fatalf("missing submission accepted: exit=%d", code)
 	}
 }
 

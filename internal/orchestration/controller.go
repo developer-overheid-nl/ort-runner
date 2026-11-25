@@ -36,15 +36,9 @@ type ControllerConfig struct {
 	RepositoriesURL string
 	ResultsURL      string
 	ConfigDir       string
-	// ResultsMountPath is where the controller container mounts the results
-	// volume claim; the workers get the same claim. ResultsDir is where the
-	// controller reads the results, which is the mount path except in tests.
-	ResultsMountPath string
-	ResultsDir       string
-	Settings         WorkerSettings
-	RegisterClient   register.Client
-	FailureReporter  FailureReporter
-	ResultDeliverer  ResultDeliverer
+	Settings        WorkerSettings
+	RegisterClient  register.Client
+	FailureReporter FailureReporter
 }
 
 type BatchSummary struct {
@@ -54,11 +48,6 @@ type BatchSummary struct {
 	Failed              int      `json:"failed"`
 	FailedRepositoryIDs []string `json:"failedRepositoryIds"`
 	Rounds              int      `json:"rounds"`
-}
-
-// ResultDeliverer delivers the result a worker wrote to dir for repository.
-type ResultDeliverer interface {
-	DeliverResult(ctx context.Context, batchID string, repository register.Repository, dir string) error
 }
 
 // FailureReporter records repositories whose worker never delivered a result.
@@ -73,12 +62,8 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 	if client == nil {
 		return BatchSummary{}, fmt.Errorf("Kubernetes client is required")
 	}
-	if cfg.Namespace == "" || cfg.PodName == "" || cfg.ContainerName == "" || cfg.BatchName == "" || cfg.RepositoriesURL == "" || cfg.ConfigDir == "" ||
-		cfg.ResultsMountPath == "" || cfg.ResultsDir == "" {
-		return BatchSummary{}, fmt.Errorf("namespace, Pod, container, batch, repository URL, config directory and results directory are required")
-	}
-	if cfg.ResultDeliverer == nil {
-		return BatchSummary{}, fmt.Errorf("result deliverer is required")
+	if cfg.Namespace == "" || cfg.PodName == "" || cfg.ContainerName == "" || cfg.BatchName == "" || cfg.RepositoriesURL == "" || cfg.ConfigDir == "" {
+		return BatchSummary{}, fmt.Errorf("namespace, Pod, container, batch, repository URL and config directory are required")
 	}
 	if cfg.ResultsURL != "" && cfg.FailureReporter == nil {
 		return BatchSummary{}, fmt.Errorf("failure reporter is required when results are configured")
@@ -90,13 +75,10 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 	if err != nil {
 		return BatchSummary{}, fmt.Errorf("read controller Pod: %w", err)
 	}
-	owner, image, resultsClaim, err := inspectControllerPod(pod, cfg.ContainerName, cfg.ResultsMountPath)
+	owner, image, environment, err := inspectControllerPod(pod, cfg.ContainerName)
 	if err != nil {
 		return BatchSummary{}, err
 	}
-	// The controller Job UID keeps batches apart on the shared volume and is a
-	// safe directory name.
-	batchDir := string(owner.UID)
 	b := batch{client: client, cfg: cfg, owner: owner}
 
 	manifest, chunks, err := b.roundManifest(ctx, 0, func() ([]register.Repository, error) {
@@ -118,13 +100,13 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 		return BatchSummary{}, err
 	}
 	template := WorkerResources{
-		Image:         image,
-		BatchID:       cfg.BatchName,
-		Rules:         rules,
-		RulesManifest: rulesManifest,
-		ORTConfig:     ortConfig,
-		ResultsClaim:  resultsClaim,
-		Settings:      cfg.Settings,
+		Image:             image,
+		BatchID:           cfg.BatchName,
+		Rules:             rules,
+		RulesManifest:     rulesManifest,
+		ORTConfig:         ortConfig,
+		ResultEnvironment: ResultEnvironment(environment),
+		Settings:          cfg.Settings,
 	}
 
 	var failed []register.Repository
@@ -143,7 +125,6 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 		resources.RepositoryCount = len(manifest.Repositories)
 		resources.ManifestChunks = chunks
 		resources.RoundDeadline = cfg.Settings.Deadline
-		resources.ResultsPrefix = filepath.Join(batchDir, "round-"+strconv.Itoa(round))
 		if round > 0 {
 			// At least one second: a restarted controller may adopt a round after
 			// the batch deadline; a new Job then stops immediately.
@@ -161,24 +142,12 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 			return summary, err
 		}
 		summary.Rounds = round + 1
-		for _, index := range outcome.completed {
-			repository := manifest.Repositories[index]
-			dir := filepath.Join(cfg.ResultsDir, resources.ResultsPrefix, strconv.Itoa(index))
-			if err := cfg.ResultDeliverer.DeliverResult(ctx, cfg.BatchName, repository, dir); err != nil {
-				if ctx.Err() != nil {
-					return summary, ctx.Err()
-				}
-				slog.Warn("Result not delivered", "batch_id", cfg.BatchName, "repository_id", repository.ID, "error", err)
-				failed = append(failed, repository)
-				continue
-			}
-			summary.Completed++
-		}
+		summary.Completed += outcome.completed
 		failed = append(failed, outcome.failed...)
-		slog.Info("ORT round finished", "batch_id", cfg.BatchName, "round", round, "completed", len(outcome.completed),
+		slog.Info("ORT round finished", "batch_id", cfg.BatchName, "round", round, "completed", outcome.completed,
 			"failed", len(outcome.failed), "unfinished", len(outcome.unfinished), "reason", outcome.reason)
 
-		progressed := len(outcome.completed) > 0 || len(outcome.failed) > 0
+		progressed := outcome.completed > 0 || len(outcome.failed) > 0
 		retry := outcome.reason == batchv1.JobReasonBackoffLimitExceeded && progressed &&
 			time.Until(batchEnd) >= time.Minute
 		if len(outcome.unfinished) == 0 || !retry {
@@ -199,11 +168,6 @@ func RunController(ctx context.Context, client kubernetes.Interface, cfg Control
 		}
 	}
 	sort.Strings(summary.FailedRepositoryIDs)
-	// Results stay on the volume until the batch is done, so a restarted
-	// controller can deliver them again; the idempotency key prevents doubles.
-	if err := os.RemoveAll(filepath.Join(cfg.ResultsDir, batchDir)); err != nil {
-		slog.Warn("Removing batch results failed", "batch_id", cfg.BatchName, "error", err)
-	}
 	return summary, nil
 }
 
@@ -395,9 +359,7 @@ func ParseIndexes(value string, total int) ([]int, error) {
 	return indexes, nil
 }
 
-// inspectControllerPod returns the controlling Job of the controller Pod, the
-// image of the controller container and the claim it mounts at resultsMountPath.
-func inspectControllerPod(pod *corev1.Pod, containerName, resultsMountPath string) (metav1.OwnerReference, string, string, error) {
+func inspectControllerPod(pod *corev1.Pod, containerName string) (metav1.OwnerReference, string, []corev1.EnvVar, error) {
 	var owners []metav1.OwnerReference
 	for _, owner := range pod.OwnerReferences {
 		if owner.Controller != nil && *owner.Controller && owner.Kind == "Job" && owner.UID != "" {
@@ -405,40 +367,17 @@ func inspectControllerPod(pod *corev1.Pod, containerName, resultsMountPath strin
 		}
 	}
 	if len(owners) != 1 {
-		return metav1.OwnerReference{}, "", "", fmt.Errorf("controller Pod must have exactly one controlling Job owner")
+		return metav1.OwnerReference{}, "", nil, fmt.Errorf("controller Pod must have exactly one controlling Job owner")
 	}
 	for _, container := range pod.Spec.Containers {
-		if container.Name != containerName {
-			continue
-		}
-		if container.Image == "" {
-			return metav1.OwnerReference{}, "", "", fmt.Errorf("controller image is empty")
-		}
-		claim, err := mountedClaim(pod, container, resultsMountPath)
-		if err != nil {
-			return metav1.OwnerReference{}, "", "", err
-		}
-		return owners[0], container.Image, claim, nil
-	}
-	return metav1.OwnerReference{}, "", "", fmt.Errorf("controller container %q not found", containerName)
-}
-
-func mountedClaim(pod *corev1.Pod, container corev1.Container, mountPath string) (string, error) {
-	for _, mount := range container.VolumeMounts {
-		if filepath.Clean(mount.MountPath) != filepath.Clean(mountPath) {
-			continue
-		}
-		if mount.SubPath != "" || mount.SubPathExpr != "" {
-			return "", fmt.Errorf("results volume at %s must be mounted without a subpath", mountPath)
-		}
-		for _, volume := range pod.Spec.Volumes {
-			if volume.Name == mount.Name && volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName != "" {
-				return volume.PersistentVolumeClaim.ClaimName, nil
+		if container.Name == containerName {
+			if container.Image == "" {
+				return metav1.OwnerReference{}, "", nil, fmt.Errorf("controller image is empty")
 			}
+			return owners[0], container.Image, container.Env, nil
 		}
-		return "", fmt.Errorf("volume mounted at %s is not a PersistentVolumeClaim", mountPath)
 	}
-	return "", fmt.Errorf("controller container does not mount a results volume at %s", mountPath)
+	return metav1.OwnerReference{}, "", nil, fmt.Errorf("controller container %q not found", containerName)
 }
 
 // readRules reads the evaluator rules, which ORT is given, and the optional
@@ -547,7 +486,7 @@ func jobTerminal(job *batchv1.Job) bool {
 }
 
 type outcome struct {
-	completed  []int
+	completed  int
 	failed     []register.Repository
 	unfinished []register.Repository
 	reason     string
@@ -570,7 +509,7 @@ func roundOutcome(job *batchv1.Job, manifest Manifest) (outcome, error) {
 	for _, index := range completed {
 		state[index] = 'c'
 	}
-	result := outcome{completed: completed}
+	result := outcome{completed: len(completed)}
 	for _, index := range failed {
 		if state[index] == 'c' {
 			return outcome{}, fmt.Errorf("index %d is both completed and failed", index)
