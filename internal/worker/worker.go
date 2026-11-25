@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -24,6 +25,10 @@ import (
 )
 
 const submissionFile = "submission.json"
+
+// maxSubmissionBytes bounds the submission that delivery reads from the output
+// directory, which the scan container can write.
+const maxSubmissionBytes = 16 << 20
 
 var chunkNamePattern = regexp.MustCompile(`^chunk-([0-9]{4})-([0-9a-f]{64})\.json$`)
 
@@ -43,10 +48,12 @@ type ScanConfig struct {
 }
 
 type DeliverConfig struct {
-	BatchID    string
-	OutputDir  string
-	ResultsURL string
-	Client     register.Client
+	BatchID         string
+	CompletionIndex int
+	ManifestDir     string
+	OutputDir       string
+	ResultsURL      string
+	Client          register.Client
 
 	sleep func(context.Context, time.Duration) error
 }
@@ -121,20 +128,36 @@ func Scan(ctx context.Context, cfg ScanConfig) (runner.Submission, error) {
 
 // Deliver posts the submission written by Scan. Without a result endpoint it
 // only logs the outcome.
+//
+// The scan container runs code from the scanned repository and can write the
+// output directory. The repository a result belongs to therefore comes from the
+// read-only manifest and the completion index, never from the submission file;
+// a submission for another repository is not delivered.
 func Deliver(ctx context.Context, cfg DeliverConfig) error {
-	if cfg.BatchID == "" || cfg.OutputDir == "" {
-		return fmt.Errorf("batch ID and output directory are required")
+	if cfg.BatchID == "" || cfg.ManifestDir == "" || cfg.OutputDir == "" {
+		return fmt.Errorf("batch ID, manifest directory and output directory are required")
 	}
-	data, err := os.ReadFile(filepath.Join(cfg.OutputDir, submissionFile))
+	manifest, err := readManifest(cfg.ManifestDir)
 	if err != nil {
-		return fmt.Errorf("read submission: %w", err)
+		return err
+	}
+	if manifest.BatchID != cfg.BatchID {
+		return fmt.Errorf("manifest batch ID %q does not match %q", manifest.BatchID, cfg.BatchID)
+	}
+	repository, err := manifest.Repository(cfg.CompletionIndex)
+	if err != nil {
+		return err
+	}
+	data, err := readSubmissionFile(filepath.Join(cfg.OutputDir, submissionFile))
+	if err != nil {
+		return err
 	}
 	var submission runner.Submission
 	if err := json.Unmarshal(data, &submission); err != nil {
 		return fmt.Errorf("decode submission: %w", err)
 	}
-	if submission.RepositoryID == "" {
-		return fmt.Errorf("submission has no repository ID")
+	if submission.RepositoryID != repository.ID {
+		return fmt.Errorf("submission is for repository %q, completion index %d is repository %q", submission.RepositoryID, cfg.CompletionIndex, repository.ID)
 	}
 	if cfg.ResultsURL == "" {
 		slog.Info("Result delivery not configured", "batch_id", cfg.BatchID, "repository_id", submission.RepositoryID, "scan_status", submission.Scan.Status)
@@ -159,6 +182,22 @@ func Deliver(ctx context.Context, cfg DeliverConfig) error {
 			return err
 		}
 	}
+}
+
+func readSubmissionFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read submission: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, maxSubmissionBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read submission: %w", err)
+	}
+	if len(data) > maxSubmissionBytes {
+		return nil, fmt.Errorf("submission exceeds %d bytes", maxSubmissionBytes)
+	}
+	return data, nil
 }
 
 func readManifest(directory string) (orchestration.Manifest, error) {

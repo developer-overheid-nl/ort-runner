@@ -210,13 +210,17 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 			corev1.KeyToPath{Key: manifestChunkKey, Path: fmt.Sprintf("chunk-%04d-%s.json", chunk.Index, chunk.Digest)}))
 	}
 
-	batch := []corev1.EnvVar{{Name: "ORT_BATCH_ID", Value: resources.BatchID}, {Name: "ORT_OUTPUT_DIR", Value: "/output"}}
+	batch := []corev1.EnvVar{
+		{Name: "ORT_BATCH_ID", Value: resources.BatchID},
+		{Name: "ORT_OUTPUT_DIR", Value: "/output"},
+		{Name: "ORT_MANIFEST_DIR", Value: "/manifest"},
+	}
+	manifestMount := corev1.VolumeMount{Name: manifestVolumeName, MountPath: "/manifest", ReadOnly: true}
 	scan := corev1.Container{
 		Name:    scanContainerName,
 		Image:   resources.Image,
 		Command: []string{"ort-runner", "worker"},
 		Env: append(slices.Clone(batch),
-			corev1.EnvVar{Name: "ORT_MANIFEST_DIR", Value: "/manifest"},
 			corev1.EnvVar{Name: "ORT_CONFIG_DIR", Value: "/config"},
 			corev1.EnvVar{Name: "ORT_OPTS", Value: ortJavaOptions},
 			corev1.EnvVar{Name: "ORT_REPOSITORY_TIMEOUT", Value: resources.Settings.RepositoryTimeout.String()},
@@ -225,7 +229,7 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 		SecurityContext: restrictedContainer(),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: rulesVolumeName, MountPath: "/config", ReadOnly: true},
-			{Name: manifestVolumeName, MountPath: "/manifest", ReadOnly: true},
+			manifestMount,
 			{Name: gradleVolumeName, MountPath: "/home/ort/.gradle/gradle.properties", SubPath: "gradle.properties", ReadOnly: true},
 			{Name: outputVolumeName, MountPath: "/output"},
 		},
@@ -240,7 +244,8 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
 		},
 		SecurityContext: restrictedContainer(),
-		VolumeMounts:    []corev1.VolumeMount{{Name: outputVolumeName, MountPath: "/output", ReadOnly: true}},
+		// The manifest, not the scan output, decides which repository the result is for.
+		VolumeMounts: []corev1.VolumeMount{{Name: outputVolumeName, MountPath: "/output", ReadOnly: true}, manifestMount},
 	}
 
 	labels := map[string]string{
