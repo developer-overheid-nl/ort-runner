@@ -1,0 +1,3 @@
+kind: Security
+body: De levering leidt de repository af uit het read-only manifest en `JOB_COMPLETION_INDEX` en weigert een `submission.json` voor een andere repository of groter dan 16 MiB, zodat code die tijdens de scan draait geen resultaat kan afleveren onder het ID van een andere repository.
+time: 2026-11-11T15:00:00+01:00
