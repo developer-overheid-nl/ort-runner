@@ -30,6 +30,10 @@ const (
 	manifestVolumeName   = "manifest"
 	gradleVolumeName     = "gradle"
 	outputVolumeName     = "output"
+	tmpVolumeName        = "tmp"
+	varTmpVolumeName     = "var-tmp"
+	homeVolumeName       = "home"
+	cargoVolumeName      = "cargo"
 	scanContainerName    = "scan"
 	// Kubernetes sets this variable in every container of an Indexed Job Pod.
 	completionIndexVariable = "JOB_COMPLETION_INDEX"
@@ -226,6 +230,13 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 			// Kubernetes sets JOB_COMPLETION_INDEX in every container of an Indexed
 			// Job, so each worker only sees its own directory on the shared volume.
 			{Name: outputVolumeName, MountPath: "/output", SubPathExpr: "$(ORT_RESULTS_PREFIX)/$(" + completionIndexVariable + ")"},
+			// The root filesystem is read-only. ORT and the package managers write
+			// here; the image sets GEM_HOME=/var/tmp/gem and CARGO_HOME=/opt/rust/cargo.
+			{Name: tmpVolumeName, MountPath: "/tmp"},
+			{Name: varTmpVolumeName, MountPath: "/var/tmp"},
+			{Name: homeVolumeName, MountPath: "/home/ort"},
+			{Name: cargoVolumeName, MountPath: "/opt/rust/cargo/registry", SubPath: "registry"},
+			{Name: cargoVolumeName, MountPath: "/opt/rust/cargo/git", SubPath: "git"},
 		},
 	}
 
@@ -267,6 +278,10 @@ func BuildIndexedJob(owner metav1.OwnerReference, namespace, name string, resour
 						projectedVolume(manifestVolumeName, manifestSources...),
 						projectedVolume(gradleVolumeName, configMapProjection(rulesConfigMapName(owner), corev1.KeyToPath{Key: "gradle.properties", Path: "gradle.properties"})),
 						{Name: outputVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: resources.ResultsClaim}}},
+						emptyDirVolume(tmpVolumeName),
+						emptyDirVolume(varTmpVolumeName),
+						emptyDirVolume(homeVolumeName),
+						emptyDirVolume(cargoVolumeName),
 					},
 				},
 			},
@@ -311,7 +326,14 @@ func restrictedContainer() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		ReadOnlyRootFilesystem:   ptr.To(true),
 	}
+}
+
+// emptyDir volumes count towards the ephemeral-storage limit of the Pod, just
+// like the writable container layer did.
+func emptyDirVolume(name string) corev1.Volume {
+	return corev1.Volume{Name: name, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}
 }
 
 func configMapProjection(name string, items ...corev1.KeyToPath) corev1.VolumeProjection {

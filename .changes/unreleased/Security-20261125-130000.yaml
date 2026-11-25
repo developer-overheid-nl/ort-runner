@@ -1,0 +1,3 @@
+kind: Security
+body: De scan-container van de worker-Pods draait met een read-only root filesystem. ORT en de package managers schrijven naar emptyDirs op `/tmp`, `/var/tmp`, `/home/ort` en de `registry`- en `git`-map van `CARGO_HOME`.
+time: 2026-11-25T13:00:00+01:00

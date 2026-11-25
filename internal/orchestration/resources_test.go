@@ -112,7 +112,16 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 		}
 	}
 	output := false
+	emptyDirs := map[string]bool{}
+	for _, volume := range pod.Volumes {
+		emptyDirs[volume.Name] = volume.EmptyDir != nil
+	}
+	scratch := map[string]bool{}
 	for _, mount := range scan.VolumeMounts {
+		if emptyDirs[mount.Name] {
+			scratch[mount.MountPath] = !mount.ReadOnly
+			continue
+		}
 		if mount.Name == outputVolumeName {
 			// Each worker sees only its own directory on the shared volume.
 			output = mount.MountPath == "/output" && !mount.ReadOnly && mount.SubPath == "" &&
@@ -126,6 +135,11 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 	if !output {
 		t.Fatalf("scan output is not its own directory on the results volume: %+v", scan.VolumeMounts)
 	}
+	for _, path := range []string{"/tmp", "/var/tmp", "/home/ort", "/opt/rust/cargo/registry", "/opt/rust/cargo/git"} {
+		if !scratch[path] {
+			t.Fatalf("no writable scratch directory at %s: %+v", path, scan.VolumeMounts)
+		}
+	}
 	claim := false
 	for _, volume := range pod.Volumes {
 		if volume.Name == outputVolumeName {
@@ -135,7 +149,8 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 	if !claim {
 		t.Fatalf("output volume is not the results claim: %+v", pod.Volumes)
 	}
-	if *scan.SecurityContext.AllowPrivilegeEscalation || !slices.Equal(scan.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+	if *scan.SecurityContext.AllowPrivilegeEscalation || !slices.Equal(scan.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) ||
+		scan.SecurityContext.ReadOnlyRootFilesystem == nil || !*scan.SecurityContext.ReadOnlyRootFilesystem {
 		t.Fatalf("scan security context=%+v", scan.SecurityContext)
 	}
 }
