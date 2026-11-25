@@ -77,6 +77,18 @@ func (e *env) int(name string, fallback int) int {
 	return parsed
 }
 
+func (e *env) bool(name string, fallback bool) bool {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		e.errs = append(e.errs, fmt.Errorf("%s must be true or false", name))
+	}
+	return parsed
+}
+
 func (e *env) err() error { return errors.Join(e.errs...) }
 
 func (e *env) auth() commonauth.ClientCredentialsConfig {
@@ -121,6 +133,8 @@ func loadControllerConfig() (controllerConfig, error) {
 				MemoryLimit:             e.string("ORT_WORKER_MEMORY_LIMIT", "8Gi"),
 				EphemeralStorageRequest: e.string("ORT_WORKER_EPHEMERAL_STORAGE_REQUEST", "10Gi"),
 				EphemeralStorageLimit:   e.string("ORT_WORKER_EPHEMERAL_STORAGE_LIMIT", "30Gi"),
+				UserNamespace:           e.bool("ORT_WORKER_USER_NAMESPACE", false),
+				RuntimeClassName:        os.Getenv("ORT_WORKER_RUNTIME_CLASS"),
 			},
 		},
 		HTTP: httpSettings{

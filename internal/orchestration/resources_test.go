@@ -140,6 +140,32 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 	}
 }
 
+func TestBuildIndexedJobKernelIsolationIsOptIn(t *testing.T) {
+	resources := testWorkerResources(t)
+	job, err := BuildIndexedJob(testOwner(), "oss", "job", resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := job.Spec.Template.Spec
+	if pod.HostUsers != nil || pod.RuntimeClassName != nil {
+		t.Fatalf("isolation set without settings: hostUsers=%v runtimeClass=%v", pod.HostUsers, pod.RuntimeClassName)
+	}
+
+	resources.Settings.UserNamespace = true
+	resources.Settings.RuntimeClassName = "gvisor"
+	isolated, err := BuildIndexedJob(testOwner(), "oss", "job", resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod = isolated.Spec.Template.Spec
+	if pod.HostUsers == nil || *pod.HostUsers || pod.RuntimeClassName == nil || *pod.RuntimeClassName != "gvisor" {
+		t.Fatalf("isolation not applied: hostUsers=%v runtimeClass=%v", pod.HostUsers, pod.RuntimeClassName)
+	}
+	if isolated.Annotations[specHashAnnotation] == job.Annotations[specHashAnnotation] {
+		t.Fatal("isolation settings do not change the Job spec hash")
+	}
+}
+
 func TestBuildResourcesRejectsInvalidConfiguration(t *testing.T) {
 	valid := testWorkerResources(t)
 	for _, tc := range []struct {
@@ -164,6 +190,7 @@ func TestBuildResourcesRejectsInvalidConfiguration(t *testing.T) {
 		{name: "absolute prefix", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.ResultsPrefix = "/batch" }},
 		{name: "escaping prefix", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.ResultsPrefix = "batch/../../other" }},
 		{name: "quantity", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.MemoryLimit = "many" }},
+		{name: "runtime class", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.RuntimeClassName = "Not_A_Name" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resources := valid
