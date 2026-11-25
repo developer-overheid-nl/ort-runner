@@ -40,6 +40,7 @@ func executeController(ctx context.Context, args []string, stdout, stderr io.Wri
 	}
 	run := cfg.Orchestration
 	run.RegisterClient = register.Client{HTTP: httpClient, APIKey: cfg.HTTP.APIKey}
+	run.ResultDeliverer = resultDeliverer{endpoint: run.ResultsURL, client: register.Client{HTTP: httpClient}}
 	if run.ResultsURL != "" {
 		run.FailureReporter = failedIndexReporter{endpoint: run.ResultsURL, client: register.Client{HTTP: httpClient}}
 	}
@@ -95,6 +96,20 @@ func requireSupportedKubernetes(info *k8sversion.Info) error {
 		return fmt.Errorf("Kubernetes server %s is unsupported; version 1.%d or newer is required", info.GitVersion, minimumKubernetesMinor)
 	}
 	return nil
+}
+
+// resultDeliverer delivers what a worker wrote to its result directory. Without
+// an endpoint it only logs the outcome.
+type resultDeliverer struct {
+	endpoint string
+	client   register.Client
+}
+
+func (deliverer resultDeliverer) DeliverResult(ctx context.Context, batchID string, repository register.Repository, dir string) error {
+	return worker.Deliver(ctx, worker.DeliverConfig{
+		BatchID: batchID, Repository: repository, Dir: dir,
+		ResultsURL: deliverer.endpoint, Client: deliverer.client,
+	})
 }
 
 type failedIndexReporter struct {

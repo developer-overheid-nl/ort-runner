@@ -1,0 +1,3 @@
+kind: Security
+body: De controller levert de resultaten af in plaats van een `deliver`-container in de worker-Pod. Workers schrijven `submission.json` naar hun eigen map op een gedeelde ReadWriteMany-PVC en krijgen geen credentials meer. De controller vindt die PVC via de mount op `ORT_RESULTS_DIR` (verplicht), volgt geen symlinks en weigert een submission voor een andere repository. Het `deliver`-commando is vervallen.
+time: 2026-11-12T10:00:00+01:00

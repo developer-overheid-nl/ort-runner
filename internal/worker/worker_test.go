@@ -174,7 +174,7 @@ func TestDeliverFailsAfterRetries(t *testing.T) {
 
 func TestDeliverRejectsMissingSubmission(t *testing.T) {
 	cfg := deliverConfig(t, "")
-	if err := os.Remove(filepath.Join(cfg.OutputDir, submissionFile)); err != nil {
+	if err := os.Remove(filepath.Join(cfg.Dir, submissionFile)); err != nil {
 		t.Fatal(err)
 	}
 	if err := Deliver(context.Background(), cfg); err == nil {
@@ -193,27 +193,70 @@ func TestDeliverRejectsSubmissionForOtherRepository(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := deliverConfig(t, server.URL)
-	writeSubmission(t, cfg.OutputDir, runner.Submission{SchemaVersion: 1, RepositoryID: "repo-b", Scan: runner.Report{Status: "completed"}})
+	writeSubmission(t, cfg.Dir, runner.Submission{SchemaVersion: 1, RepositoryID: "repo-b", Scan: runner.Report{Status: "completed"}})
 	if err := Deliver(context.Background(), cfg); err == nil || posted {
 		t.Fatalf("submission for another repository delivered: posted=%t err=%v", posted, err)
 	}
 }
 
-func TestDeliverRejectsInvalidManifestSelection(t *testing.T) {
+// The controller reads the result directory of a worker on the shared volume.
+// The worker controls its contents, so links must not lead the controller to
+// files outside that directory.
+func TestDeliverRejectsLinks(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, cfg *DeliverConfig)
+	}{
+		{name: "file link", setup: func(t *testing.T, cfg *DeliverConfig) {
+			target := filepath.Join(t.TempDir(), "elsewhere.json")
+			if err := os.Rename(filepath.Join(cfg.Dir, submissionFile), target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(cfg.Dir, submissionFile)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "directory link", setup: func(t *testing.T, cfg *DeliverConfig) {
+			link := filepath.Join(t.TempDir(), "link")
+			if err := os.Symlink(cfg.Dir, link); err != nil {
+				t.Fatal(err)
+			}
+			cfg.Dir = link
+		}},
+		{name: "not a regular file", setup: func(t *testing.T, cfg *DeliverConfig) {
+			path := filepath.Join(cfg.Dir, submissionFile)
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := deliverConfig(t, "")
+			tc.setup(t, &cfg)
+			if err := Deliver(context.Background(), cfg); err == nil {
+				t.Fatal("submission read through a link")
+			}
+		})
+	}
+}
+
+func TestDeliverRejectsInvalidConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		mutate func(*DeliverConfig)
 	}{
-		{name: "negative index", mutate: func(cfg *DeliverConfig) { cfg.CompletionIndex = -1 }},
-		{name: "out of range", mutate: func(cfg *DeliverConfig) { cfg.CompletionIndex = 1 }},
-		{name: "batch mismatch", mutate: func(cfg *DeliverConfig) { cfg.BatchID = "other" }},
-		{name: "missing manifest", mutate: func(cfg *DeliverConfig) { cfg.ManifestDir = t.TempDir() }},
+		{name: "batch", mutate: func(cfg *DeliverConfig) { cfg.BatchID = "" }},
+		{name: "repository", mutate: func(cfg *DeliverConfig) { cfg.Repository.ID = "" }},
+		{name: "directory", mutate: func(cfg *DeliverConfig) { cfg.Dir = "" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := deliverConfig(t, "")
 			tc.mutate(&cfg)
 			if err := Deliver(context.Background(), cfg); err == nil {
-				t.Fatal("invalid manifest selection accepted")
+				t.Fatal("invalid config accepted")
 			}
 		})
 	}
@@ -227,7 +270,7 @@ func TestDeliverRejectsOversizedSubmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	data = append(data, bytes.Repeat([]byte(" "), maxSubmissionBytes+1-len(data))...)
-	if err := os.WriteFile(filepath.Join(cfg.OutputDir, submissionFile), data, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.Dir, submissionFile), data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := Deliver(context.Background(), cfg); err == nil {
@@ -268,7 +311,7 @@ func deliverConfig(t *testing.T, resultsURL string) DeliverConfig {
 	outputDir := t.TempDir()
 	writeSubmission(t, outputDir, runner.Submission{SchemaVersion: 1, RepositoryID: "repo-a", Scan: runner.Report{Status: "completed"}})
 	return DeliverConfig{
-		BatchID: "batch-1", CompletionIndex: 0, ManifestDir: writeManifest(t), OutputDir: outputDir, ResultsURL: resultsURL,
+		BatchID: "batch-1", Repository: register.Repository{ID: "repo-a", URL: "https://example.test/a.git"}, Dir: outputDir, ResultsURL: resultsURL,
 		Client: register.Client{HTTP: http.DefaultClient},
 		sleep:  func(context.Context, time.Duration) error { t.Fatal("unexpected retry"); return nil },
 	}
