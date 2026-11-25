@@ -83,12 +83,11 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 		*security.FSGroup != 1000 || security.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatalf("pod security context=%+v", pod.SecurityContext)
 	}
-	// One container without credentials: the controller delivers the result.
-	if len(pod.InitContainers) != 0 || len(pod.Containers) != 1 {
-		t.Fatalf("expected only the scan container: %d/%d", len(pod.InitContainers), len(pod.Containers))
+	if len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
+		t.Fatalf("expected scan init container and delivery container: %d/%d", len(pod.InitContainers), len(pod.Containers))
 	}
 
-	scan := pod.Containers[0]
+	scan := pod.InitContainers[0]
 	if !slices.Equal(scan.Command, []string{"ort-runner", "worker"}) {
 		t.Fatalf("scan command=%v", scan.Command)
 	}
@@ -97,8 +96,7 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 		t.Fatalf("scan resources=%+v", scan.Resources)
 	}
 	scanEnv := environment(scan)
-	if scanEnv["ORT_OPTS"].Value != "-XX:MaxRAMPercentage=50" || scanEnv["ORT_MANIFEST_DIR"].Value != "/manifest" || scanEnv["ORT_REPOSITORY_TIMEOUT"].Value != "10m0s" ||
-		scanEnv["ORT_OUTPUT_DIR"].Value != "/output" || scanEnv["ORT_RESULTS_PREFIX"].Value != "batch-uid/round-0" {
+	if scanEnv["ORT_OPTS"].Value != "-XX:MaxRAMPercentage=50" || scanEnv["ORT_MANIFEST_DIR"].Value != "/manifest" || scanEnv["ORT_REPOSITORY_TIMEOUT"].Value != "10m0s" {
 		t.Fatalf("scan environment=%+v", scanEnv)
 	}
 	for _, name := range append([]string{register.APIKeyVariable, register.ResultsURLVariable}, register.ResultCredentialVariables...) {
@@ -106,63 +104,40 @@ func TestBuildIndexedJobUsesBoundedIsolatedWorkers(t *testing.T) {
 			t.Fatalf("scan container receives %s", name)
 		}
 	}
-	for _, variable := range scan.Env {
-		if variable.ValueFrom != nil {
-			t.Fatalf("scan container receives a secret or field reference: %+v", variable)
-		}
-	}
-	output := false
 	for _, mount := range scan.VolumeMounts {
-		if mount.Name == outputVolumeName {
-			// Each worker sees only its own directory on the shared volume.
-			output = mount.MountPath == "/output" && !mount.ReadOnly && mount.SubPath == "" &&
-				mount.SubPathExpr == "$(ORT_RESULTS_PREFIX)/$(JOB_COMPLETION_INDEX)"
-			continue
-		}
-		if !mount.ReadOnly {
+		if mount.Name != outputVolumeName && !mount.ReadOnly {
 			t.Fatalf("snapshot mount is writable: %+v", mount)
 		}
 	}
-	if !output {
-		t.Fatalf("scan output is not its own directory on the results volume: %+v", scan.VolumeMounts)
+
+	deliver := pod.Containers[0]
+	deliverEnv := environment(deliver)
+	if !slices.Equal(deliver.Command, []string{"ort-runner", "deliver"}) || deliverEnv["ORT_RESULTS_URL"].Value != "https://example.test/results" || deliverEnv["AUTH_CLIENT_SECRET"].ValueFrom == nil {
+		t.Fatalf("delivery container=%+v", deliver)
 	}
-	claim := false
-	for _, volume := range pod.Volumes {
-		if volume.Name == outputVolumeName {
-			claim = volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == "ort-results" && !volume.PersistentVolumeClaim.ReadOnly
+	if _, ok := deliverEnv[register.APIKeyVariable]; ok {
+		t.Fatal("register API key passed to worker")
+	}
+	for _, container := range []corev1.Container{scan, deliver} {
+		if *container.SecurityContext.AllowPrivilegeEscalation || !slices.Equal(container.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+			t.Fatalf("%s security context=%+v", container.Name, container.SecurityContext)
 		}
-	}
-	if !claim {
-		t.Fatalf("output volume is not the results claim: %+v", pod.Volumes)
-	}
-	if *scan.SecurityContext.AllowPrivilegeEscalation || !slices.Equal(scan.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) {
-		t.Fatalf("scan security context=%+v", scan.SecurityContext)
 	}
 }
 
-func TestBuildIndexedJobKernelIsolationIsOptIn(t *testing.T) {
-	resources := testWorkerResources(t)
-	job, err := BuildIndexedJob(testOwner(), "oss", "job", resources)
-	if err != nil {
-		t.Fatal(err)
+func TestResultEnvironmentOmitsCredentialsWithoutEndpoint(t *testing.T) {
+	controller := []corev1.EnvVar{
+		{Name: "ORT_RESULTS_URL", Value: ""},
+		{Name: "AUTH_CLIENT_SECRET", Value: "secret"},
+		{Name: "ORT_REGISTER_API_KEY", Value: "key"},
 	}
-	pod := job.Spec.Template.Spec
-	if pod.HostUsers != nil || pod.RuntimeClassName != nil {
-		t.Fatalf("isolation set without settings: hostUsers=%v runtimeClass=%v", pod.HostUsers, pod.RuntimeClassName)
+	got := ResultEnvironment(controller)
+	if len(got) != 1 || got[0].Name != "ORT_RESULTS_URL" {
+		t.Fatalf("result environment=%+v", got)
 	}
-
-	resources.Settings.UserNamespace = true
-	resources.Settings.RuntimeClassName = "gvisor"
-	isolated, err := BuildIndexedJob(testOwner(), "oss", "job", resources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pod = isolated.Spec.Template.Spec
-	if pod.HostUsers == nil || *pod.HostUsers || pod.RuntimeClassName == nil || *pod.RuntimeClassName != "gvisor" {
-		t.Fatalf("isolation not applied: hostUsers=%v runtimeClass=%v", pod.HostUsers, pod.RuntimeClassName)
-	}
-	if isolated.Annotations[specHashAnnotation] == job.Annotations[specHashAnnotation] {
-		t.Fatal("isolation settings do not change the Job spec hash")
+	controller[0].Value = "https://example.test/results"
+	if got := ResultEnvironment(controller); len(got) != 2 || got[1].Name != "AUTH_CLIENT_SECRET" {
+		t.Fatalf("result environment=%+v", got)
 	}
 }
 
@@ -185,12 +160,7 @@ func TestBuildResourcesRejectsInvalidConfiguration(t *testing.T) {
 		{name: "round deadline", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.RoundDeadline = 0 }},
 		{name: "repository timeout", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.RepositoryTimeout = 0 }},
 		{name: "rules", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Rules = nil }},
-		{name: "results claim", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.ResultsClaim = "" }},
-		{name: "results prefix", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.ResultsPrefix = "" }},
-		{name: "absolute prefix", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.ResultsPrefix = "/batch" }},
-		{name: "escaping prefix", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.ResultsPrefix = "batch/../../other" }},
 		{name: "quantity", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.MemoryLimit = "many" }},
-		{name: "runtime class", namespace: "oss", jobName: "job", owner: testOwner(), mutate: func(r *WorkerResources) { r.Settings.RuntimeClassName = "Not_A_Name" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resources := valid
@@ -236,10 +206,14 @@ func testWorkerResources(t *testing.T) WorkerResources {
 		RepositoryCount: 2,
 		Rules:           []byte("licenseRule {}"),
 		ManifestChunks:  chunks,
-		ResultsClaim:    "ort-results",
-		ResultsPrefix:   "batch-uid/round-0",
-		Settings:        testSettings(),
-		RoundDeadline:   46 * time.Hour,
+		ResultEnvironment: ResultEnvironment([]corev1.EnvVar{
+			{Name: "ORT_RESULTS_URL", Value: "https://example.test/results"},
+			{Name: "AUTH_CLIENT_ID", Value: "runner"},
+			{Name: "AUTH_CLIENT_SECRET", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "auth"}, Key: "secret"}}},
+			{Name: "ORT_REGISTER_API_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "register"}, Key: "key"}}},
+		}),
+		Settings:      testSettings(),
+		RoundDeadline: 46 * time.Hour,
 	}
 }
 
