@@ -66,24 +66,35 @@ func TestControllerCommandRejectsInvalidSettingsAndArguments(t *testing.T) {
 func setValidControllerEnv(t *testing.T) {
 	t.Helper()
 	clearControllerEnv(t)
-	for _, pair := range [][2]string{{"POD_NAMESPACE", "oss"}, {"POD_NAME", "controller"}, {"ORT_BATCH_ID", "batch-1"}, {"ORT_REPOSITORIES_URL", "http://127.0.0.1:1/repositories"}, {"ORT_CONFIG_DIR", "/config"}} {
+	for _, pair := range [][2]string{{"POD_NAMESPACE", "oss"}, {"POD_NAME", "controller"}, {"ORT_BATCH_ID", "batch-1"}, {"ORT_REPOSITORIES_URL", "http://127.0.0.1:1/repositories"}, {"ORT_CONFIG_DIR", "/config"}, {"ORT_RESULTS_DIR", "/results"}} {
 		t.Setenv(pair[0], pair[1])
 	}
 }
 
 func clearControllerEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"POD_NAMESPACE", "POD_NAME", "ORT_BATCH_ID", "ORT_REPOSITORIES_URL", "ORT_RESULTS_URL", "ORT_CONFIG_DIR", "ORT_PARALLELISM", "ORT_BATCH_DEADLINE", "ORT_WORKER_CPU_REQUEST", "ORT_WORKER_CPU_LIMIT", "ORT_WORKER_MEMORY_REQUEST", "ORT_WORKER_MEMORY_LIMIT", "ORT_WORKER_EPHEMERAL_STORAGE_REQUEST", "ORT_WORKER_EPHEMERAL_STORAGE_LIMIT", "ORT_REGISTER_API_KEY"} {
+	for _, name := range []string{"POD_NAMESPACE", "POD_NAME", "ORT_BATCH_ID", "ORT_REPOSITORIES_URL", "ORT_RESULTS_URL", "ORT_RESULTS_DIR", "ORT_CONFIG_DIR", "ORT_PARALLELISM", "ORT_BATCH_DEADLINE", "ORT_WORKER_CPU_REQUEST", "ORT_WORKER_CPU_LIMIT", "ORT_WORKER_MEMORY_REQUEST", "ORT_WORKER_MEMORY_LIMIT", "ORT_WORKER_EPHEMERAL_STORAGE_REQUEST", "ORT_WORKER_EPHEMERAL_STORAGE_LIMIT", "ORT_REGISTER_API_KEY"} {
 		t.Setenv(name, "")
 	}
 	clearAuthEnv(t)
+}
+
+func TestControllerConfigReadsResultsDirectory(t *testing.T) {
+	setValidControllerEnv(t)
+	cfg, err := loadControllerConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run := cfg.Orchestration; run.ResultsMountPath != "/results" || run.ResultsDir != "/results" {
+		t.Fatalf("results mount=%q dir=%q", run.ResultsMountPath, run.ResultsDir)
+	}
 }
 
 func TestControllerConfigReportsAllProblemsAtOnce(t *testing.T) {
 	clearControllerEnv(t)
 	t.Setenv("ORT_PARALLELISM", "ten")
 	_, err := loadControllerConfig()
-	for _, want := range []string{"POD_NAMESPACE", "POD_NAME", "ORT_BATCH_ID", "ORT_REPOSITORIES_URL", "ORT_CONFIG_DIR", "ORT_PARALLELISM"} {
+	for _, want := range []string{"POD_NAMESPACE", "POD_NAME", "ORT_BATCH_ID", "ORT_REPOSITORIES_URL", "ORT_CONFIG_DIR", "ORT_RESULTS_DIR", "ORT_PARALLELISM"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("error does not mention %s: %v", want, err)
 		}
